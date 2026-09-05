@@ -1,33 +1,28 @@
 import axios from 'axios';
 import dotenv from 'dotenv';
 import * as readline from 'readline';
+import { assessTradeRisk, readDemoBalanceUSDT, type RiskAssessment } from './riskGuardian.js';
 
 dotenv.config();
 
 const SELLER_ENDPOINT = process.env.SELLER_ENDPOINT_URL || 'http://localhost:3001';
-const MAX_TRADE_SIZE_USDT = parseFloat(process.env.MAX_TRADE_SIZE_USDT || '10');
+const MAX_TRADE_SIZE_USDT = Number.parseFloat(process.env.MAX_TRADE_SIZE_USDT || '10');
+const APPROVAL_MODE = process.env.APPROVAL_MODE || 'dashboard';
+const APPROVAL_TIMEOUT_MS = Number.parseInt(process.env.APPROVAL_TIMEOUT_MS || '120000', 10);
+const APPROVAL_POLL_MS = Number.parseInt(process.env.APPROVAL_POLL_MS || '1000', 10);
 const CONFIRMATION_REQUIRED = process.env.CONFIRMATION_REQUIRED !== 'false';
 
-// Create readline interface for user input (lazy initialization)
 let rl: readline.Interface | null = null;
 
 function getReadline(): readline.Interface {
   if (!rl) {
-    rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout
-    });
+    rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   }
   return rl;
 }
 
 function prompt(question: string): Promise<string> {
-  return new Promise((resolve) => {
-    const readlineInst = getReadline();
-    readlineInst.question(question, (answer) => {
-      resolve(answer);
-    });
-  });
+  return new Promise((resolve) => getReadline().question(question, resolve));
 }
 
 function closeReadline(): void {
@@ -37,231 +32,247 @@ function closeReadline(): void {
   }
 }
 
-// x402 Payment Client using official @x402/core protocol
-async function makeX402Payment(amount: number, currency: string, resource: string): Promise<string> {
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+// The production implementation would create a signed PaymentPayload with
+// @x402/core. This deterministic demo payload keeps the local flow safe.
+async function makeX402Payment(amount: number, currency: string, _resource: string): Promise<string> {
   console.log(`\n💳 Processing x402 payment of ${amount} ${currency}...`);
-  
-  // In production with real Binance Agentic sub-account:
-  // 1. Initialize x402Client with wallet/facilitator from @x402/core
-  // 2. Get payment requirements from 402 response
-  // 3. Create and sign payment via x402Client.createPayment()
-  // 4. Encode payment as HTTP header using encodePaymentSignatureHeader
-  
-  // For demo: simulate the x402 payment flow following protocol spec
-  await new Promise(resolve => setTimeout(resolve, 1000));
-  
-  // Simulated payment payload (in production this would be a signed PaymentPayload)
+  await sleep(500);
+
   const paymentPayload = {
     version: 2,
     scheme: 'erc20',
     network: 'base',
     payTo: '0xSIMULATED_ADDRESS',
-    amount: Math.floor(amount * 1000000), // USDC has 6 decimals
+    amount: Math.floor(amount * 1_000_000),
     asset: '0xUSDC_ADDRESS',
-    signature: `0x${Date.now().toString(16)}${Math.random().toString(16).substring(2, 10)}`
+    signature: `0x${Date.now().toString(16)}${Math.random().toString(16).substring(2, 10)}`,
   };
-  
-  // Encode as base64 header (matching x402 protocol spec for X-X402-Payment)
+
   const paymentHeader = Buffer.from(JSON.stringify(paymentPayload)).toString('base64');
-  
-  console.log(`✅ x402 payment created! Header: ${paymentHeader.substring(0, 30)}...`);
+  console.log(`✅ x402 payment created. Header: ${paymentHeader.substring(0, 30)}...`);
   return paymentHeader;
 }
 
+async function purchaseReport(): Promise<{ briefing: string; metadata: Record<string, unknown> }> {
+  console.log('\n🔍 Discovering Seller endpoint...');
+  const infoResponse = await axios.get(`${SELLER_ENDPOINT}/api/report/info`);
+  const reportInfo = infoResponse.data;
 
-// Purchase research report from Seller Agent
-async function purchaseReport(): Promise<any> {
+  console.log('\n📋 Report details:');
+  console.log(`   Service: ${reportInfo.service}`);
+  console.log(`   Price: ${reportInfo.price} ${reportInfo.currency}`);
+  console.log(`   Protocol: ${reportInfo.payment_protocol}`);
+  console.log('\n📡 Requesting report without payment...');
+
   try {
-    console.log('\n🔍 Discovering Seller endpoint...');
-    
-    // Get report info
-    const infoResponse = await axios.get(`${SELLER_ENDPOINT}/api/report/info`);
-    const reportInfo = infoResponse.data;
-    
-    console.log(`\n📋 Report Details:`);
-    console.log(`   Service: ${reportInfo.service}`);
-    console.log(`   Price: ${reportInfo.price} ${reportInfo.currency}`);
-    console.log(`   Protocol: ${reportInfo.payment_protocol}`);
-    
-    // First attempt: Try to fetch report WITHOUT payment (expect HTTP 402)
-    console.log('\n📡 Requesting report (no payment yet)...');
-    try {
-      await axios.post(`${SELLER_ENDPOINT}/api/report`, {});
-    } catch (error: any) {
-      if (error.response?.status === 402) {
-        console.log('\n⚠️  HTTP 402 Payment Required received!');
-        console.log(`   Amount: ${error.response.headers['x-payment-amount']} ${error.response.headers['x-payment-currency']}`);
-        console.log(`   Network: ${error.response.headers['x-payment-network']}`);
-        
-        // Make x402 payment to settle the required amount
-        const amount = parseFloat(error.response.headers['x-payment-amount']);
-        const currency = error.response.headers['x-payment-currency'];
-        const resource = error.response.headers['x-payment-resource'];
-        
-        const paymentProof = await makeX402Payment(amount, currency, resource);
-        
-        // Retry with x402 payment header
-        console.log('\n📥 Purchasing report with x402 payment...');
-        const purchaseResponse = await axios.post(`${SELLER_ENDPOINT}/api/report`, 
-          {}, 
-          { headers: { 'X-X402-Payment': paymentProof } }
-        );
-        
-        if (!purchaseResponse.data.success) {
-          throw new Error('Failed to purchase report');
-        }
-        
-        return purchaseResponse.data;
-      } else {
-        throw error;
-      }
+    await axios.post(`${SELLER_ENDPOINT}/api/report`, {});
+    throw new Error('Expected HTTP 402 but received a report without payment');
+  } catch (error: unknown) {
+    if (!axios.isAxiosError(error) || error.response?.status !== 402) {
+      throw error;
     }
-    
-    throw new Error('Expected 402 but got success without payment');
-  } catch (error: any) {
-    console.error('❌ Error purchasing report:', error.message);
-    throw error;
+
+    console.log('\n⚠️  HTTP 402 Payment Required received.');
+    console.log(`   Amount: ${error.response.headers['x-payment-amount']} ${error.response.headers['x-payment-currency']}`);
+    console.log(`   Network: ${error.response.headers['x-payment-network']}`);
+
+    const amount = Number.parseFloat(error.response.headers['x-payment-amount']);
+    const currency = error.response.headers['x-payment-currency'];
+    const resource = error.response.headers['x-payment-resource'];
+    const paymentProof = await makeX402Payment(amount, currency, resource);
+
+    console.log('\n📥 Purchasing report with x402 payment...');
+    const purchaseResponse = await axios.post(
+      `${SELLER_ENDPOINT}/api/report`,
+      {},
+      { headers: { 'X-X402-Payment': paymentProof } },
+    );
+
+    if (!purchaseResponse.data.success) throw new Error('Failed to purchase report');
+    return purchaseResponse.data;
   }
 }
 
-// Parse briefing to extract trading signal
 function parseTradingSignal(briefing: string): { sentiment: string; asset: string; recommendation: string } {
   const sentimentMatch = briefing.match(/🎯 SENTIMENT: (\w+)/);
   const assetMatch = briefing.match(/📊 ASSET: (\w+)/);
   const recommendationMatch = briefing.match(/RECOMMENDATION:\n---------------\n([\s\S]*?)(?:\n\n|⚠️|$)/);
-  
+
   return {
-    sentiment: sentimentMatch ? sentimentMatch[1] : 'UNKNOWN',
-    asset: assetMatch ? assetMatch[1] : 'UNKNOWN',
-    recommendation: recommendationMatch ? recommendationMatch[1].trim() : 'No recommendation'
+    sentiment: sentimentMatch?.[1] || 'UNKNOWN',
+    asset: assetMatch?.[1] || 'UNKNOWN',
+    recommendation: recommendationMatch?.[1]?.trim() || 'No recommendation',
   };
 }
 
-// Propose trade based on research
-async function proposeTrade(signal: any): Promise<boolean> {
-  console.log('\n╔═══════════════════════════════════════════════════════════╗');
-  console.log('║              TRADE PROPOSAL GENERATED                   ║');
-  console.log('╚═══════════════════════════════════════════════════════════╝');
-  
-  const side = signal.sentiment === 'BULLISH' ? 'BUY' : 'SELL';
-  const quantity = MAX_TRADE_SIZE_USDT; // Safety cap
-  
-  console.log(`
-📊 SIGNAL ANALYSIS:
-   Asset: ${signal.asset}
-   Sentiment: ${signal.sentiment}
-   Recommendation: ${signal.recommendation}
-
-💼 TRADE DETAILS:
-   Action: ${side}
-   Amount: $${quantity} USDT (capped for safety)
-   Type: Spot Market Order
-
-⚠️ SAFETY CHECKS:
-   ✅ Withdrawal permissions: DISABLED
-   ✅ Trade size capped at: $${MAX_TRADE_SIZE_USDT} USDT
-   ✅ Human confirmation required: ${CONFIRMATION_REQUIRED ? 'YES' : 'NO'}
-  `);
-  
-  if (!CONFIRMATION_REQUIRED) {
-    console.log('⚠️  WARNING: Human confirmation disabled - executing automatically');
-    return true;
-  }
-  
-  console.log('\n🔒 HUMAN CONFIRMATION REQUIRED');
-  const answer = await prompt('Type "CONFIRM" to execute this trade: ');
-  
-  if (answer.trim().toUpperCase() === 'CONFIRM') {
-    console.log('✅ Trade confirmed by human operator');
-    return true;
-  } else {
-    console.log('❌ Trade cancelled - no confirmation received');
-    return false;
-  }
-}
-
-// Execute trade via Binance MCP Server
-async function executeTrade(asset: string, side: string, amountUSDT: number): Promise<void> {
-  console.log(`\n🚀 Executing ${side} order for ${asset}...`);
-  
+async function publishRiskRefusal(
+  signal: { asset: string },
+  side: 'BUY' | 'SELL',
+  risk: RiskAssessment,
+): Promise<void> {
   try {
-    // In production, this would call the actual Binance MCP Server
-    // Example: POST to https://agent.binance.com/mcp/agentic with trade parameters
-    
-    console.log('   Connecting to Binance MCP Server...');
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    console.log('   Submitting order...');
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    // Simulated order response
-    const orderId = `ORDER_${Date.now()}`;
-    
-    console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║                  TRADE EXECUTED SUCCESSFULLY              ║
-╚═══════════════════════════════════════════════════════════╝
-
-📋 ORDER DETAILS:
-   Order ID: ${orderId}
-   Asset: ${asset}
-   Side: ${side}
-   Value: $${amountUSDT} USDT
-   Status: FILLED (simulated)
-
-⚠️ REMINDER: This is a demo. In production, this would execute
-   via the Binance MCP Server with real funds.
-    `);
-  } catch (error: any) {
-    console.error('❌ Trade execution failed:', error.message);
-    throw error;
+    await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, {
+      proposalId: `risk_${Date.now()}`,
+      asset: signal.asset,
+      side,
+      amountUSDT: risk.proposedSizeUSDT,
+      balanceUSDT: risk.balanceUSDT,
+      status: 'refused',
+      riskStatus: 'refused',
+      reason: risk.reason,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown dashboard error';
+    console.error(`⚠️  Could not update the dashboard: ${message}`);
   }
 }
 
-// Main Buyer Agent workflow
+async function createTradeProposal(
+  signal: { asset: string },
+  side: 'BUY' | 'SELL',
+  risk: RiskAssessment,
+): Promise<{ proposalId: string }> {
+  const proposalId = `proposal_${Date.now()}`;
+  const response = await axios.post(`${SELLER_ENDPOINT}/api/trade/proposal`, {
+    proposalId,
+    asset: signal.asset,
+    side,
+    amountUSDT: risk.proposedSizeUSDT,
+    balanceUSDT: risk.balanceUSDT,
+    reason: risk.reason,
+  });
+  return response.data;
+}
+
+async function waitForDashboardApproval(proposalId: string): Promise<boolean> {
+  const deadline = Date.now() + APPROVAL_TIMEOUT_MS;
+  console.log(`\n🖥️  Proposal ${proposalId} is waiting in the Seller dashboard.`);
+  console.log('   Click APPROVE in http://localhost:3001 when you are ready.');
+
+  while (Date.now() < deadline) {
+    const response = await axios.get(`${SELLER_ENDPOINT}/api/trade/proposal/${proposalId}`);
+    const status = response.data.status as string;
+    if (status === 'approved') return true;
+    if (status === 'refused' || status === 'cancelled') return false;
+    await sleep(APPROVAL_POLL_MS);
+  }
+
+  console.log('⌛ Dashboard approval timed out.');
+  return false;
+}
+
+async function requestTerminalApproval(): Promise<boolean> {
+  if (!CONFIRMATION_REQUIRED) {
+    console.log('⚠️  WARNING: Human confirmation disabled.');
+    return true;
+  }
+  const answer = await prompt('Type "CONFIRM" to execute this trade: ');
+  return answer.trim().toUpperCase() === 'CONFIRM';
+}
+
+async function executeTrade(
+  asset: string,
+  side: 'BUY' | 'SELL',
+  amountUSDT: number,
+  proposalId: string,
+): Promise<void> {
+  console.log(`\n🚀 Executing ${side} order for ${asset}...`);
+  console.log('   Connecting to Binance MCP Server...');
+  await sleep(500);
+  console.log('   Submitting order...');
+  await sleep(500);
+
+  const orderId = `ORDER_${Date.now()}`;
+  console.log(`\n✅ Trade FILLED!`);
+  console.log(`   Order ID: ${orderId}`);
+  console.log(`   Asset: ${asset}`);
+  console.log(`   Side: ${side}`);
+  console.log(`   Value: $${amountUSDT} USDT`);
+  console.log('   Status: FILLED (simulated)');
+
+  await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, {
+    proposalId,
+    status: 'filled',
+    reason: `Trade FILLED. Simulated Binance MCP order ${orderId}`,
+  });
+}
+
+async function proposeTrade(
+  signal: { sentiment: string; asset: string; recommendation: string },
+): Promise<{ approved: boolean; proposalId?: string; side: 'BUY' | 'SELL'; risk: RiskAssessment }> {
+  const side: 'BUY' | 'SELL' = signal.sentiment === 'BULLISH' ? 'BUY' : 'SELL';
+  const risk = assessTradeRisk(readDemoBalanceUSDT(), MAX_TRADE_SIZE_USDT);
+
+  console.log('\n╔═══════════════════════════════════════════════════════════╗');
+  console.log('║              TRADE PROPOSAL GENERATED                    ║');
+  console.log('╚═══════════════════════════════════════════════════════════╝');
+  console.log(`\n📊 SIGNAL ANALYSIS:\n   Asset: ${signal.asset}\n   Sentiment: ${signal.sentiment}\n   Recommendation: ${signal.recommendation}`);
+  console.log(`\n💼 TRADE DETAILS:\n   Action: ${side}\n   Amount: $${MAX_TRADE_SIZE_USDT} USDT (capped for safety)\n   Type: Spot Market Order`);
+  console.log(`\n⚠️  SAFETY CHECKS:\n   ✅ Withdrawal permissions: DISABLED\n   ✅ Trade size capped at: $${MAX_TRADE_SIZE_USDT} USDT\n   ✅ Available USDT: $${risk.balanceUSDT.toFixed(2)}`);
+
+  if (!risk.approved) {
+    console.log(`\n🛡️  RISK GUARDIAN: refused`);
+    console.log(`   ${risk.reason}`);
+    await publishRiskRefusal(signal, side, risk);
+    return { approved: false, side, risk };
+  }
+
+  console.log(`\n🛡️  RISK GUARDIAN: approved`);
+  console.log(`   ${risk.reason}`);
+
+  if (APPROVAL_MODE === 'terminal') {
+    console.log('\n🔒 HUMAN CONFIRMATION REQUIRED');
+    const confirmed = await requestTerminalApproval();
+    return { approved: confirmed, side, risk, proposalId: `terminal_${Date.now()}` };
+  }
+
+  const proposal = await createTradeProposal(signal, side, risk);
+  const approved = await waitForDashboardApproval(proposal.proposalId);
+  return { approved, side, risk, proposalId: proposal.proposalId };
+}
+
 async function runBuyerAgent(): Promise<void> {
   console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║              SIGNAL402 BUYER AGENT STARTED                ║
 ╚═══════════════════════════════════════════════════════════╝
 
-🤖 Role: Research Consumer & Trader
+🤖 Role: Research Consumer and Trader
 🎯 Goal: Purchase market intelligence and act on signals
-🔒 Safety: No withdrawal permissions, human confirmation required
+🔒 Safety: Risk Guardian, no withdrawals, human approval
 
 Starting agent workflow...
   `);
-  
+
   try {
-    // Step 1: Purchase research report
     const report = await purchaseReport();
     console.log('\n' + report.briefing);
-    
-    // Step 2: Parse trading signal from research
+
     const signal = parseTradingSignal(report.briefing);
     console.log('\n🧠 Analyzing research for trading signals...');
     console.log(`   Detected sentiment: ${signal.sentiment}`);
-    
-    // Step 3: Propose trade and get human confirmation
-    const confirmed = await proposeTrade(signal);
-    
-    if (!confirmed) {
-      console.log('\n🛑 Workflow terminated - trade not confirmed');
-      closeReadline();
+
+    const decision = await proposeTrade(signal);
+    if (!decision.approved || !decision.proposalId) {
+      console.log('\n🛑 Workflow terminated. Trade was not approved.');
       return;
     }
-    
-    // Step 4: Execute trade
-    const side = signal.sentiment === 'BULLISH' ? 'BUY' : 'SELL';
-    await executeTrade(signal.asset, side, MAX_TRADE_SIZE_USDT);
-    
+
+    await executeTrade(signal.asset, decision.side, decision.risk.proposedSizeUSDT, decision.proposalId);
     console.log('\n✅ Agent workflow completed successfully');
-  } catch (error: any) {
-    console.error('\n❌ Agent workflow failed:', error.message);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Unknown buyer error';
+    console.error(`\n❌ Agent workflow failed: ${message}`);
   } finally {
     closeReadline();
   }
 }
 
-// Run the Buyer Agent
-runBuyerAgent().catch(console.error);
+runBuyerAgent().catch((error: unknown) => {
+  console.error(error);
+  closeReadline();
+});
