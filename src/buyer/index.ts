@@ -1,278 +1,206 @@
+import 'dotenv/config';
+
 import axios from 'axios';
-import dotenv from 'dotenv';
-import * as readline from 'readline';
-import { assessTradeRisk, readDemoBalanceUSDT, type RiskAssessment } from './riskGuardian.js';
+import { audit } from '../lib/audit.js';
+import { BinanceMcpClient, extractUsdtBalance, type BinanceBalance, type BinanceOrder } from '../lib/binanceMcp.js';
+import { purchaseReport, type PaidReport } from '../lib/binanceX402Client.js';
+import { assessLiveTradeRisk, type RiskAssessment } from './riskGuardian.js';
 
-dotenv.config();
+const SELLER_ENDPOINT = process.env.SELLER_ENDPOINT_URL ?? 'http://localhost:3001';
+const SYMBOL = (process.env.TRADE_SYMBOL ?? 'BNBUSDT').toUpperCase();
+const configuredMax = Number.parseFloat(process.env.MAX_TRADE_SIZE_USDT ?? '10');
+const MAX_TRADE_SIZE_USDT = Number.isFinite(configuredMax) ? Math.min(configuredMax, 10) : 10;
+const APPROVAL_TIMEOUT_MS = Number.parseInt(process.env.APPROVAL_TIMEOUT_MS ?? '300000', 10);
+const APPROVAL_POLL_MS = Number.parseInt(process.env.APPROVAL_POLL_MS ?? '1000', 10);
 
-const SELLER_ENDPOINT = process.env.SELLER_ENDPOINT_URL || 'http://localhost:3001';
-const MAX_TRADE_SIZE_USDT = Number.parseFloat(process.env.MAX_TRADE_SIZE_USDT || '10');
-const APPROVAL_MODE = process.env.APPROVAL_MODE || 'dashboard';
-const APPROVAL_TIMEOUT_MS = Number.parseInt(process.env.APPROVAL_TIMEOUT_MS || '120000', 10);
-const APPROVAL_POLL_MS = Number.parseInt(process.env.APPROVAL_POLL_MS || '1000', 10);
-const CONFIRMATION_REQUIRED = process.env.CONFIRMATION_REQUIRED !== 'false';
-
-let rl: readline.Interface | null = null;
-
-function getReadline(): readline.Interface {
-  if (!rl) {
-    rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  }
-  return rl;
-}
-
-function prompt(question: string): Promise<string> {
-  return new Promise((resolve) => getReadline().question(question, resolve));
-}
-
-function closeReadline(): void {
-  if (rl) {
-    rl.close();
-    rl = null;
-  }
-}
+type Signal = { sentiment: string; asset: string; recommendation: string };
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-// The production implementation would create a signed PaymentPayload with
-// @x402/core. This deterministic demo payload keeps the local flow safe.
-async function makeX402Payment(amount: number, currency: string, _resource: string): Promise<string> {
-  console.log(`\n💳 Processing x402 payment of ${amount} ${currency}...`);
-  await sleep(500);
-
-  const paymentPayload = {
-    version: 2,
-    scheme: 'erc20',
-    network: 'base',
-    payTo: '0xSIMULATED_ADDRESS',
-    amount: Math.floor(amount * 1_000_000),
-    asset: '0xUSDC_ADDRESS',
-    signature: `0x${Date.now().toString(16)}${Math.random().toString(16).substring(2, 10)}`,
-  };
-
-  const paymentHeader = Buffer.from(JSON.stringify(paymentPayload)).toString('base64');
-  console.log(`✅ x402 payment created. Header: ${paymentHeader.substring(0, 30)}...`);
-  return paymentHeader;
+function parseTradingSignal(briefing: string): Signal {
+  const sentiment = briefing.match(/SENTIMENT:\s*([A-Z]+)/i)?.[1]?.toUpperCase() ?? 'UNKNOWN';
+  const asset = briefing.match(/ASSET:\s*([A-Z0-9]+)/i)?.[1]?.toUpperCase() ?? SYMBOL;
+  const recommendation = briefing.split('RECOMMENDATION:')[1]?.trim() ?? 'No recommendation';
+  return { sentiment, asset, recommendation };
 }
 
-async function purchaseReport(): Promise<{ briefing: string; metadata: Record<string, unknown> }> {
-  console.log('\n🔍 Discovering Seller endpoint...');
-  const infoResponse = await axios.get(`${SELLER_ENDPOINT}/api/report/info`);
-  const reportInfo = infoResponse.data;
-
-  console.log('\n📋 Report details:');
-  console.log(`   Service: ${reportInfo.service}`);
-  console.log(`   Price: ${reportInfo.price} ${reportInfo.currency}`);
-  console.log(`   Protocol: ${reportInfo.payment_protocol}`);
-  console.log('\n📡 Requesting report without payment...');
-
-  try {
-    await axios.post(`${SELLER_ENDPOINT}/api/report`, {});
-    throw new Error('Expected HTTP 402 but received a report without payment');
-  } catch (error: unknown) {
-    if (!axios.isAxiosError(error) || error.response?.status !== 402) {
-      throw error;
-    }
-
-    console.log('\n⚠️  HTTP 402 Payment Required received.');
-    console.log(`   Amount: ${error.response.headers['x-payment-amount']} ${error.response.headers['x-payment-currency']}`);
-    console.log(`   Network: ${error.response.headers['x-payment-network']}`);
-
-    const amount = Number.parseFloat(error.response.headers['x-payment-amount']);
-    const currency = error.response.headers['x-payment-currency'];
-    const resource = error.response.headers['x-payment-resource'];
-    const paymentProof = await makeX402Payment(amount, currency, resource);
-
-    console.log('\n📥 Purchasing report with x402 payment...');
-    const purchaseResponse = await axios.post(
-      `${SELLER_ENDPOINT}/api/report`,
-      {},
-      { headers: { 'X-X402-Payment': paymentProof } },
-    );
-
-    if (!purchaseResponse.data.success) throw new Error('Failed to purchase report');
-    return purchaseResponse.data;
-  }
-}
-
-function parseTradingSignal(briefing: string): { sentiment: string; asset: string; recommendation: string } {
-  const sentimentMatch = briefing.match(/🎯 SENTIMENT: (\w+)/);
-  const assetMatch = briefing.match(/📊 ASSET: (\w+)/);
-  const recommendationMatch = briefing.match(/RECOMMENDATION:\n---------------\n([\s\S]*?)(?:\n\n|⚠️|$)/);
-
-  return {
-    sentiment: sentimentMatch?.[1] || 'UNKNOWN',
-    asset: assetMatch?.[1] || 'UNKNOWN',
-    recommendation: recommendationMatch?.[1]?.trim() || 'No recommendation',
-  };
+function balanceSnapshot(balances: BinanceBalance[]): Array<{ asset: string; free: number; locked: number }> {
+  return balances.map((balance) => ({ asset: balance.asset, free: balance.free, locked: balance.locked }));
 }
 
 async function publishRiskRefusal(
-  signal: { asset: string },
-  side: 'BUY' | 'SELL',
+  signal: Signal,
   risk: RiskAssessment,
-): Promise<void> {
-  try {
-    await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, {
-      proposalId: `risk_${Date.now()}`,
+  paymentReceiptId: string | undefined,
+  beforeBalances: BinanceBalance[],
+  existingProposalId?: string,
+): Promise<string> {
+  const proposalId = existingProposalId ?? `risk_${Date.now()}`;
+  if (!existingProposalId) {
+    await axios.post(`${SELLER_ENDPOINT}/api/trade/proposal`, {
+      proposalId,
       asset: signal.asset,
-      side,
+      side: 'BUY',
       amountUSDT: risk.proposedSizeUSDT,
       balanceUSDT: risk.balanceUSDT,
-      status: 'refused',
       riskStatus: 'refused',
+      status: 'refused',
       reason: risk.reason,
+      ...(paymentReceiptId ? { paymentReceiptId } : {}),
+      beforeBalances: balanceSnapshot(beforeBalances),
     });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown dashboard error';
-    console.error(`⚠️  Could not update the dashboard: ${message}`);
   }
+  await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, {
+    proposalId,
+    asset: signal.asset,
+    side: 'BUY',
+    amountUSDT: risk.proposedSizeUSDT,
+    balanceUSDT: risk.balanceUSDT,
+    status: 'refused',
+    riskStatus: 'refused',
+    reason: risk.reason,
+    ...(paymentReceiptId ? { paymentReceiptId } : {}),
+    beforeBalances: balanceSnapshot(beforeBalances),
+  });
+  await audit('buyer.risk.refused', { proposalId, asset: signal.asset, proposedSizeUSDT: risk.proposedSizeUSDT, balanceUSDT: risk.balanceUSDT });
+  return proposalId;
 }
 
-async function createTradeProposal(
-  signal: { asset: string },
-  side: 'BUY' | 'SELL',
-  risk: RiskAssessment,
-): Promise<{ proposalId: string }> {
+async function createTradeProposal(signal: Signal, risk: RiskAssessment, paymentReceiptId: string): Promise<string> {
   const proposalId = `proposal_${Date.now()}`;
   const response = await axios.post(`${SELLER_ENDPOINT}/api/trade/proposal`, {
     proposalId,
     asset: signal.asset,
-    side,
+    side: 'BUY',
     amountUSDT: risk.proposedSizeUSDT,
     balanceUSDT: risk.balanceUSDT,
+    riskStatus: 'approved',
     reason: risk.reason,
+    paymentReceiptId,
   });
-  return response.data;
+  if (!response.data?.proposalId) throw new Error('Seller did not create a trade proposal');
+  await audit('buyer.trade.proposed', { proposalId, asset: signal.asset, amountUSDT: risk.proposedSizeUSDT, balanceUSDT: risk.balanceUSDT });
+  return `${response.data.proposalId}`;
 }
 
 async function waitForDashboardApproval(proposalId: string): Promise<boolean> {
   const deadline = Date.now() + APPROVAL_TIMEOUT_MS;
   console.log(`\n🖥️  Proposal ${proposalId} is waiting in the Seller dashboard.`);
-  console.log('   Click APPROVE in http://localhost:3001 when you are ready.');
-
+  console.log('   Open http://localhost:3001 and click APPROVE.');
   while (Date.now() < deadline) {
-    const response = await axios.get(`${SELLER_ENDPOINT}/api/trade/proposal/${proposalId}`);
-    const status = response.data.status as string;
+    const response = await axios.get(`${SELLER_ENDPOINT}/api/trade/proposal/${encodeURIComponent(proposalId)}`);
+    const status = `${response.data.status}`;
     if (status === 'approved') return true;
     if (status === 'refused' || status === 'cancelled') return false;
     await sleep(APPROVAL_POLL_MS);
   }
-
-  console.log('⌛ Dashboard approval timed out.');
+  await audit('buyer.trade.approval_timeout', { proposalId });
+  console.log('⌛ Dashboard approval timed out. No order was submitted.');
   return false;
 }
 
-async function requestTerminalApproval(): Promise<boolean> {
-  if (!CONFIRMATION_REQUIRED) {
-    console.log('⚠️  WARNING: Human confirmation disabled.');
-    return true;
-  }
-  const answer = await prompt('Type "CONFIRM" to execute this trade: ');
-  return answer.trim().toUpperCase() === 'CONFIRM';
+function filledPrice(order: BinanceOrder): number | undefined {
+  if (order.averagePrice !== undefined && Number.isFinite(order.averagePrice) && order.averagePrice > 0) return order.averagePrice;
+  if (order.quoteAmount !== undefined && order.executedQty !== undefined && order.executedQty > 0) return order.quoteAmount / order.executedQty;
+  return undefined;
 }
 
-async function executeTrade(
-  asset: string,
-  side: 'BUY' | 'SELL',
-  amountUSDT: number,
+async function publishTradeFilled(
   proposalId: string,
+  signal: Signal,
+  order: BinanceOrder,
+  before: BinanceBalance[],
+  after: BinanceBalance[],
 ): Promise<void> {
-  console.log(`\n🚀 Executing ${side} order for ${asset}...`);
-  console.log('   Connecting to Binance MCP Server...');
-  await sleep(500);
-  console.log('   Submitting order...');
-  await sleep(500);
-
-  const orderId = `ORDER_${Date.now()}`;
-  console.log(`\n✅ Trade FILLED!`);
-  console.log(`   Order ID: ${orderId}`);
-  console.log(`   Asset: ${asset}`);
-  console.log(`   Side: ${side}`);
-  console.log(`   Value: $${amountUSDT} USDT`);
-  console.log('   Status: FILLED (simulated)');
-
+  const price = filledPrice(order);
+  if (price === undefined) throw new Error('MCP order response did not include a real filled price');
   await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, {
     proposalId,
+    asset: signal.asset,
+    side: 'BUY',
+    amountUSDT: order.quoteAmount,
     status: 'filled',
-    reason: `Trade FILLED. Simulated Binance MCP order ${orderId}`,
+    riskStatus: 'approved',
+    orderId: order.orderId,
+    filledPrice: price,
+    beforeBalances: balanceSnapshot(before),
+    afterBalances: balanceSnapshot(after),
+    reason: `Real Binance MCP Spot MARKET BUY ${order.orderId} confirmed with post-trade balance read.`,
   });
+  await audit('buyer.trade.filled', { proposalId, orderId: order.orderId, filledPrice: price, beforeBalances: balanceSnapshot(before), afterBalances: balanceSnapshot(after) });
 }
 
-async function proposeTrade(
-  signal: { sentiment: string; asset: string; recommendation: string },
-): Promise<{ approved: boolean; proposalId?: string; side: 'BUY' | 'SELL'; risk: RiskAssessment }> {
-  const side: 'BUY' | 'SELL' = signal.sentiment === 'BULLISH' ? 'BUY' : 'SELL';
-  const risk = assessTradeRisk(readDemoBalanceUSDT(), MAX_TRADE_SIZE_USDT);
-
-  console.log('\n╔═══════════════════════════════════════════════════════════╗');
-  console.log('║              TRADE PROPOSAL GENERATED                    ║');
-  console.log('╚═══════════════════════════════════════════════════════════╝');
-  console.log(`\n📊 SIGNAL ANALYSIS:\n   Asset: ${signal.asset}\n   Sentiment: ${signal.sentiment}\n   Recommendation: ${signal.recommendation}`);
-  console.log(`\n💼 TRADE DETAILS:\n   Action: ${side}\n   Amount: $${MAX_TRADE_SIZE_USDT} USDT (capped for safety)\n   Type: Spot Market Order`);
-  console.log(`\n⚠️  SAFETY CHECKS:\n   ✅ Withdrawal permissions: DISABLED\n   ✅ Trade size capped at: $${MAX_TRADE_SIZE_USDT} USDT\n   ✅ Available USDT: $${risk.balanceUSDT.toFixed(2)}`);
-
-  if (!risk.approved) {
-    console.log(`\n🛡️  RISK GUARDIAN: refused`);
-    console.log(`   ${risk.reason}`);
-    await publishRiskRefusal(signal, side, risk);
-    return { approved: false, side, risk };
+async function executeApprovedTrade(
+  mcp: BinanceMcpClient,
+  proposalId: string,
+  signal: Signal,
+): Promise<void> {
+  const liveRisk = await assessLiveTradeRisk(mcp, MAX_TRADE_SIZE_USDT);
+  const beforeBalances = liveRisk.balances;
+  const beforeUSDT = extractUsdtBalance(beforeBalances);
+  const finalRisk = liveRisk.assessment;
+  if (!finalRisk.approved) {
+    await publishRiskRefusal(signal, finalRisk, undefined, beforeBalances, proposalId);
+    throw new Error(`Risk Guardian refused after approval because the live balance changed: ${finalRisk.reason}`);
   }
-
-  console.log(`\n🛡️  RISK GUARDIAN: approved`);
-  console.log(`   ${risk.reason}`);
-
-  if (APPROVAL_MODE === 'terminal') {
-    console.log('\n🔒 HUMAN CONFIRMATION REQUIRED');
-    const confirmed = await requestTerminalApproval();
-    return { approved: confirmed, side, risk, proposalId: `terminal_${Date.now()}` };
-  }
-
-  const proposal = await createTradeProposal(signal, side, risk);
-  const approved = await waitForDashboardApproval(proposal.proposalId);
-  return { approved, side, risk, proposalId: proposal.proposalId };
+  if (beforeUSDT < MAX_TRADE_SIZE_USDT) throw new Error('Live USDT balance is below the capped order size');
+  console.log(`\n🚀 Human approval received. Submitting REAL Binance MCP Spot MARKET BUY for ${MAX_TRADE_SIZE_USDT.toFixed(2)} USDT.`);
+  const order = await mcp.placeSpotOrder({ symbol: signal.asset || SYMBOL, side: 'BUY', quoteOrderQty: MAX_TRADE_SIZE_USDT });
+  const afterBalances = await mcp.getBalances();
+  const price = filledPrice(order);
+  if (!price) throw new Error(`Binance returned order ${order.orderId} without a filled price`);
+  console.log('\n✅ Trade FILLED!');
+  console.log(`   Real order ID: ${order.orderId}`);
+  console.log(`   Filled price: ${price}`);
+  console.log(`   USDT before: ${beforeUSDT.toFixed(8)}`);
+  console.log(`   USDT after: ${extractUsdtBalance(afterBalances).toFixed(8)}`);
+  await publishTradeFilled(proposalId, signal, order, beforeBalances, afterBalances);
 }
 
 async function runBuyerAgent(): Promise<void> {
-  console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║              SIGNAL402 BUYER AGENT STARTED                ║
-╚═══════════════════════════════════════════════════════════╝
-
-🤖 Role: Research Consumer and Trader
-🎯 Goal: Purchase market intelligence and act on signals
-🔒 Safety: Risk Guardian, no withdrawals, human approval
-
-Starting agent workflow...
-  `);
-
+  console.log(`\nSIGNAL402 BUYER AGENT\nReal Binance payment, real MCP account reads, real Spot order after dashboard approval.\nOrder cap: ${MAX_TRADE_SIZE_USDT.toFixed(2)} USDT\n`);
+  if (configuredMax > 10) console.log('MAX_TRADE_SIZE_USDT was above the hard 10 USDT safety cap. It was reduced to 10 USDT.');
+  const mcp = new BinanceMcpClient();
+  let report: PaidReport | undefined;
   try {
-    const report = await purchaseReport();
-    console.log('\n' + report.briefing);
-
-    const signal = parseTradingSignal(report.briefing);
-    console.log('\n🧠 Analyzing research for trading signals...');
-    console.log(`   Detected sentiment: ${signal.sentiment}`);
-
-    const decision = await proposeTrade(signal);
-    if (!decision.approved || !decision.proposalId) {
-      console.log('\n🛑 Workflow terminated. Trade was not approved.');
+    report = await purchaseReport(SELLER_ENDPOINT);
+    const briefing = typeof report.body === 'object' && report.body && 'briefing' in report.body
+      ? `${(report.body as { briefing: unknown }).briefing}`
+      : '';
+    if (!briefing) throw new Error('Paid seller response did not include a briefing');
+    console.log(`\n${briefing}`);
+    console.log(`\n💳 Real x402 settlement receipt: ${report.paymentReceiptId}`);
+    const signal = parseTradingSignal(briefing);
+    await mcp.connect();
+    const liveRisk = await assessLiveTradeRisk(mcp, MAX_TRADE_SIZE_USDT);
+    const beforeBalances = liveRisk.balances;
+    const balanceUSDT = extractUsdtBalance(beforeBalances);
+    const risk = liveRisk.assessment;
+    console.log(`\n🛡️  RISK GUARDIAN: ${risk.approved ? 'approved' : 'refused'}`);
+    console.log(`   ${risk.reason}`);
+    if (!risk.approved) {
+      await publishRiskRefusal(signal, risk, report.paymentReceiptId, beforeBalances);
+      console.log('🛑 No order was submitted. The dashboard shows the refusal.');
       return;
     }
-
-    await executeTrade(signal.asset, decision.side, decision.risk.proposedSizeUSDT, decision.proposalId);
-    console.log('\n✅ Agent workflow completed successfully');
+    const proposalId = await createTradeProposal(signal, risk, report.paymentReceiptId);
+    const approved = await waitForDashboardApproval(proposalId);
+    if (!approved) {
+      await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, { proposalId, status: 'cancelled', reason: 'Human dashboard approval was not received.' });
+      console.log('🛑 No order was submitted.');
+      return;
+    }
+    await executeApprovedTrade(mcp, proposalId, signal);
+    console.log('\n✅ Buyer workflow completed with real settlement and real Binance order data.');
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'Unknown buyer error';
-    console.error(`\n❌ Agent workflow failed: ${message}`);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`\n❌ Buyer workflow stopped: ${message}`);
+    await audit('buyer.workflow.error', { error: message, paymentReceiptId: report?.paymentReceiptId });
   } finally {
-    closeReadline();
+    await mcp.close();
   }
 }
 
-runBuyerAgent().catch((error: unknown) => {
-  console.error(error);
-  closeReadline();
-});
+void runBuyerAgent();

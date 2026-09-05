@@ -1,485 +1,350 @@
-import express from 'express';
-import cors from 'cors';
+import 'dotenv/config';
+
 import axios from 'axios';
-import dotenv from 'dotenv';
+import cors from 'cors';
+import express, { type Request, type Response } from 'express';
+import { audit } from '../lib/audit.js';
+import { BinanceMcpClient, type BinanceTicker } from '../lib/binanceMcp.js';
+import {
+  b402IsConfigured,
+  buildPaymentRequired,
+  reportPriceUsdc,
+  verifyAndSettlePayment,
+  type SettlementReceipt,
+} from '../lib/binanceX402.js';
 
-dotenv.config();
+const PORT = Number.parseInt(process.env.SELLER_PORT ?? '3001', 10);
+const SYMBOL = (process.env.TRADE_SYMBOL ?? 'BNBUSDT').toUpperCase();
+const PUBLIC_BASE_URL = process.env.PUBLIC_SELLER_URL ?? `http://localhost:${PORT}`;
+const ALLOW_PUBLIC_REST_FALLBACK = process.env.ALLOW_PUBLIC_REST_FALLBACK === 'true';
+const MAX_TRADE_SIZE_USDT = Number.parseFloat(process.env.MAX_TRADE_SIZE_USDT ?? '10');
 
-interface MarketData {
-  symbol: string;
-  price: number;
-  priceChangePercent: number;
-  highPrice: number;
-  lowPrice: number;
-  volume: number;
-  timestamp: string;
-}
+type MarketSource = 'MCP' | 'FALLBACK' | 'UNAVAILABLE';
+type ProposalStatus = 'idle' | 'pending' | 'approved' | 'refused' | 'filled' | 'cancelled';
 
-type TradeStatus = 'pending' | 'approved' | 'refused' | 'filled' | 'cancelled';
-type RiskStatus = 'idle' | 'approved' | 'refused' | 'filled' | 'cancelled';
-
-interface TradeProposal {
+type TradeProposal = {
   proposalId: string;
   asset: string;
   side: 'BUY' | 'SELL';
   amountUSDT: number;
   balanceUSDT: number;
-  status: TradeStatus;
-  reason?: string;
-  createdAt: string;
+  reason: string;
+  status: ProposalStatus;
+  riskStatus: 'approved' | 'refused' | 'pending';
+  paymentReceiptId?: string;
+  orderId?: string;
+  filledPrice?: number;
+  beforeBalances?: unknown;
+  afterBalances?: unknown;
   updatedAt: string;
-}
+};
 
-interface DashboardState {
-  marketData: MarketData | null;
-  riskStatus: RiskStatus;
-  tradeProposal: TradeProposal | null;
-  reportSales: number;
-  lastEvent: string;
-  lastError: string | null;
+type SellerState = {
+  service: string;
+  symbol: string;
+  mcpStatus: 'connecting' | 'live' | 'error';
+  mcpTools: string[];
+  marketSource: MarketSource;
+  ticker?: BinanceTicker;
+  lastError?: string;
+  reportsSold: number;
+  paymentReceiptId?: string;
+  paymentStatus: 'waiting' | 'settled' | 'error';
+  proposal?: TradeProposal;
+  activity: string[];
   updatedAt: string;
-}
+};
 
-const app = express();
-const PORT = Number.parseInt(process.env.SELLER_PORT ?? '3001', 10);
-const REPORT_PRICE_USDC = Number.parseFloat(process.env.REPORT_PRICE_USDC ?? '0.01');
-
-app.use(cors());
-app.use(express.json());
-
-const dashboardState: DashboardState = {
-  marketData: null,
-  riskStatus: 'idle',
-  tradeProposal: null,
-  reportSales: 0,
-  lastEvent: 'Seller is ready for a Buyer agent',
-  lastError: null,
+const state: SellerState = {
+  service: 'Signal402 Seller Agent',
+  symbol: SYMBOL,
+  mcpStatus: 'connecting',
+  mcpTools: [],
+  marketSource: 'UNAVAILABLE',
+  reportsSold: 0,
+  paymentStatus: 'waiting',
+  activity: [],
   updatedAt: new Date().toISOString(),
 };
 
-const proposals = new Map<string, TradeProposal>();
+const mcp = new BinanceMcpClient();
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '32kb' }));
 
-function touchState(event: string): void {
-  dashboardState.lastEvent = event;
-  dashboardState.updatedAt = new Date().toISOString();
+function touch(message: string): void {
+  state.updatedAt = new Date().toISOString();
+  state.activity = [`${new Date().toLocaleTimeString()} ${message}`, ...state.activity].slice(0, 30);
 }
 
-// Fetch live 24 hour data from the public Binance REST endpoint.
-async function fetchMarketData(): Promise<MarketData> {
-  const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr', {
-    params: { symbol: 'BNBUSDT' },
-    timeout: 8_000,
-  });
+function publicState(): SellerState {
+  return JSON.parse(JSON.stringify(state)) as SellerState;
+}
 
+async function readPublicRestTicker(): Promise<BinanceTicker> {
+  const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr', { params: { symbol: SYMBOL }, timeout: 10_000 });
+  const data = response.data as Record<string, unknown>;
+  const price = Number.parseFloat(`${data.lastPrice ?? ''}`);
+  if (!Number.isFinite(price)) throw new Error('Binance public REST fallback returned no lastPrice');
   return {
-    symbol: response.data.symbol,
-    price: Number.parseFloat(response.data.lastPrice),
-    priceChangePercent: Number.parseFloat(response.data.priceChangePercent),
-    highPrice: Number.parseFloat(response.data.highPrice),
-    lowPrice: Number.parseFloat(response.data.lowPrice),
-    volume: Number.parseFloat(response.data.volume),
-    timestamp: new Date().toISOString(),
+    symbol: `${data.symbol ?? SYMBOL}`,
+    price,
+    changePercent: Number.parseFloat(`${data.priceChangePercent ?? ''}`),
+    raw: data,
   };
 }
 
-async function refreshMarketData(): Promise<MarketData | null> {
+async function refreshMarketData(): Promise<void> {
+  state.mcpStatus = 'connecting';
   try {
-    const marketData = await fetchMarketData();
-    dashboardState.marketData = marketData;
-    dashboardState.lastError = null;
-    dashboardState.updatedAt = new Date().toISOString();
-    return marketData;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown Binance API error';
-    dashboardState.lastError = message;
-    return dashboardState.marketData;
+    const ticker = await mcp.getTicker(SYMBOL);
+    state.mcpStatus = 'live';
+    state.mcpTools = mcp.toolNames;
+    state.marketSource = 'MCP';
+    state.ticker = ticker;
+    state.lastError = undefined;
+    touch(`MCP market data live ${ticker.symbol} ${ticker.price}`);
+    await audit('seller.market.read', { source: 'MCP', symbol: ticker.symbol, price: ticker.price });
+  } catch (error: unknown) {
+    state.mcpStatus = 'error';
+    state.lastError = error instanceof Error ? error.message : String(error);
+    state.mcpTools = mcp.toolNames;
+    if (!ALLOW_PUBLIC_REST_FALLBACK) {
+      state.marketSource = 'UNAVAILABLE';
+      touch('MCP market data unavailable. REST fallback is disabled.');
+      await audit('seller.market.error', { source: 'MCP', error: state.lastError });
+      return;
+    }
+    try {
+      const ticker = await readPublicRestTicker();
+      state.marketSource = 'FALLBACK';
+      state.ticker = ticker;
+      touch(`FALLBACK market data live ${ticker.symbol} ${ticker.price}`);
+      await audit('seller.market.read', { source: 'FALLBACK', symbol: ticker.symbol, price: ticker.price, reason: state.lastError });
+    } catch (fallbackError: unknown) {
+      state.marketSource = 'UNAVAILABLE';
+      state.lastError = `${state.lastError}; REST fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`;
+      touch('MCP and REST fallback market data unavailable.');
+      await audit('seller.market.error', { source: 'MCP_AND_REST', error: state.lastError });
+    }
   }
 }
 
-function generateBriefing(marketData: MarketData): string {
-  const sentiment = marketData.priceChangePercent >= 0 ? 'BULLISH' : 'BEARISH';
-  const strength = Math.abs(marketData.priceChangePercent) > 5 ? 'STRONG' : 'MODERATE';
-
-  return `
-╔═══════════════════════════════════════════════════════════╗
-║           SIGNAL402 MARKET INTELLIGENCE BRIEFING          ║
-╚═══════════════════════════════════════════════════════════╝
-
-📊 ASSET: ${marketData.symbol}
-💰 CURRENT PRICE: $${marketData.price.toFixed(2)}
-📈 24H CHANGE: ${marketData.priceChangePercent >= 0 ? '+' : ''}${marketData.priceChangePercent.toFixed(2)}%
-🎯 SENTIMENT: ${sentiment} (${strength})
-📉 24H RANGE: $${marketData.lowPrice.toFixed(2)} - $${marketData.highPrice.toFixed(2)}
-📊 24H VOLUME: ${marketData.volume.toLocaleString()}
-
-ANALYSIS:
----------
-${sentiment} momentum detected with ${strength} conviction.
-Price action suggests ${marketData.priceChangePercent >= 0 ? 'buying pressure' : 'selling pressure'} in the last 24 hours.
-Key levels to watch:
-  - Resistance: $${(marketData.price * 1.05).toFixed(2)} (+5%)
-  - Support: $${(marketData.price * 0.95).toFixed(2)} (-5%)
-
-RECOMMENDATION:
----------------
-Consider a small position aligned with the ${sentiment.toLowerCase()} trend.
-Always use stop-losses and never risk more than you can afford to lose.
-
-⚠️ DISCLAIMER: This is AI-generated research, not financial advice.
-Generated at: ${marketData.timestamp}
-  `.trim();
+function briefing(): string {
+  if (!state.ticker) throw new Error('No live market data is available');
+  const change = state.ticker.changePercent;
+  const sentiment = change !== undefined && Number.isFinite(change) && change >= 0 ? 'BULLISH' : 'BEARISH';
+  const sourceLabel = state.marketSource === 'MCP' ? 'Binance Agentic MCP' : 'PUBLIC REST FALLBACK';
+  return [
+    'SIGNAL402 LIVE MARKET BRIEFING',
+    '==============================',
+    `ASSET: ${state.ticker.symbol}`,
+    `PRICE: ${state.ticker.price.toFixed(8)} USDT`,
+    `24H CHANGE: ${change !== undefined && Number.isFinite(change) ? `${change.toFixed(2)}%` : 'unavailable'}`,
+    `SENTIMENT: ${sentiment}`,
+    `DATA SOURCE: ${sourceLabel}`,
+    `OBSERVED AT: ${new Date().toISOString()}`,
+    '',
+    'RECOMMENDATION:',
+    'Use a small MARKET BUY only after the human approval gate. The buyer enforces a 10 USDT maximum and checks its live USDT balance immediately before ordering.',
+  ].join('\n');
 }
 
-const dashboardHtml = String.raw`<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Signal402 Agent Desk</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-      tailwind.config = {
-        theme: {
-          extend: {
-            colors: {
-              ink: '#090b12',
-              panel: '#111522',
-              line: '#252b3b',
-              cyan: '#62e6e2',
-              violet: '#9d8cff'
-            },
-            boxShadow: { glow: '0 0 35px rgba(98, 230, 226, 0.10)' }
-          }
-        }
-      };
-    </script>
-  </head>
-  <body class="min-h-screen bg-ink text-slate-100 antialiased">
-    <main class="mx-auto max-w-6xl px-4 py-6 sm:px-8 sm:py-10">
-      <header class="mb-8 flex flex-col gap-5 border-b border-line pb-6 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <div class="mb-3 flex items-center gap-3 text-xs font-semibold uppercase tracking-[0.28em] text-cyan">
-            <span class="h-2 w-2 rounded-full bg-cyan shadow-[0_0_12px_#62e6e2]"></span>
-            Signal402 control room
-          </div>
-          <h1 class="text-3xl font-semibold tracking-tight text-white sm:text-5xl">Analyst Agent <span class="text-slate-500">/</span> Trader Agent</h1>
-          <p class="mt-3 max-w-2xl text-sm leading-6 text-slate-400">A pay-per-briefing marketplace with a visible risk gate before any Spot order can be approved.</p>
-        </div>
-        <div class="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-widest text-emerald-300" id="connection">LIVE</div>
-      </header>
+function paymentHeader(req: Request): string | undefined {
+  const value = req.headers['payment-signature'] ?? req.headers['x-payment-signature'];
+  return typeof value === 'string' ? value : undefined;
+}
 
-      <section class="mb-6 grid gap-4 sm:grid-cols-3">
-        <article class="rounded-2xl border border-line bg-panel p-5 shadow-glow">
-          <div class="flex items-center justify-between"><span class="text-xs uppercase tracking-widest text-slate-500">Live market</span><span class="text-xs text-cyan">BINANCE REST</span></div>
-          <div class="mt-4 flex items-end justify-between"><span class="text-3xl font-semibold" id="price">Waiting</span><span class="text-sm font-medium" id="change">Loading</span></div>
-          <div class="mt-3 text-xs text-slate-500"><span id="symbol">BNBUSDT</span> · refreshed <span id="marketTime">just now</span></div>
-        </article>
-        <article class="rounded-2xl border border-line bg-panel p-5">
-          <div class="flex items-center justify-between"><span class="text-xs uppercase tracking-widest text-slate-500">24h range</span><span class="text-xs text-slate-500">High / low</span></div>
-          <div class="mt-4 text-2xl font-semibold" id="range">Loading</div>
-          <div class="mt-3 text-xs text-slate-500">Volume <span class="text-slate-300" id="volume">Loading</span></div>
-        </article>
-        <article class="rounded-2xl border border-line bg-panel p-5">
-          <div class="text-xs uppercase tracking-widest text-slate-500">Reports sold</div>
-          <div class="mt-4 text-3xl font-semibold text-violet" id="sales">0</div>
-          <div class="mt-3 text-xs text-slate-500">x402 price <span class="text-slate-300" id="reportPrice">0.01 USDC</span></div>
-        </article>
-      </section>
+function sendPaymentChallenge(res: Response, required: Awaited<ReturnType<typeof buildPaymentRequired>>): void {
+  const encoded = required.headerValue;
+  res.setHeader('PAYMENT-REQUIRED', encoded);
+  res.setHeader('X-PAYMENT-REQUIREMENTS', encoded);
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(402).json(required.body);
+}
 
-      <section class="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
-        <article class="rounded-2xl border border-line bg-panel p-6 shadow-glow sm:p-8">
-          <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <div class="text-xs font-semibold uppercase tracking-[0.24em] text-violet">Trader Agent queue</div>
-              <h2 class="mt-2 text-2xl font-semibold">Trade proposal</h2>
-              <p class="mt-2 text-sm text-slate-400" id="event">Waiting for a Buyer agent.</p>
-            </div>
-            <div class="inline-flex w-fit items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold uppercase tracking-wide" id="riskBadge">
-              <span class="h-2 w-2 rounded-full bg-slate-500"></span> RISK GUARDIAN: idle
-            </div>
-          </div>
-          <div class="mt-8 rounded-xl border border-dashed border-line bg-black/20 p-5" id="proposalEmpty">
-            <div class="text-sm font-medium text-slate-300">No active proposal</div>
-            <div class="mt-1 text-sm text-slate-500">The Buyer agent will appear here after it purchases a briefing.</div>
-          </div>
-          <div class="mt-8 hidden rounded-xl border border-line bg-black/20 p-5" id="proposalCard">
-            <div class="grid gap-5 sm:grid-cols-2">
-              <div><div class="text-xs uppercase tracking-widest text-slate-500">Asset</div><div class="mt-2 text-xl font-semibold" id="proposalAsset">BNBUSDT</div></div>
-              <div><div class="text-xs uppercase tracking-widest text-slate-500">Action</div><div class="mt-2 text-xl font-semibold" id="proposalSide">BUY</div></div>
-              <div><div class="text-xs uppercase tracking-widest text-slate-500">Proposed size</div><div class="mt-2 text-xl font-semibold" id="proposalAmount">0 USDT</div></div>
-              <div><div class="text-xs uppercase tracking-widest text-slate-500">Available USDT</div><div class="mt-2 text-xl font-semibold" id="proposalBalance">0 USDT</div></div>
-            </div>
-            <div class="mt-5 rounded-lg border border-line bg-panel px-4 py-3 text-sm text-slate-400" id="proposalReason">Waiting for risk status.</div>
-            <button class="mt-5 w-full rounded-xl bg-cyan px-4 py-3 text-sm font-bold uppercase tracking-widest text-ink transition hover:bg-cyan/80 disabled:cursor-not-allowed disabled:opacity-40" id="approveButton">Approve trade</button>
-          </div>
-        </article>
-
-        <aside class="rounded-2xl border border-line bg-panel p-6 sm:p-8">
-          <div class="text-xs font-semibold uppercase tracking-[0.24em] text-cyan">Protocol monitor</div>
-          <h2 class="mt-2 text-2xl font-semibold">Agent safety</h2>
-          <div class="mt-6 space-y-4 text-sm">
-            <div class="flex items-center justify-between border-b border-line pb-4"><span class="text-slate-400">Payment rail</span><span class="font-medium text-emerald-300">x402 USDC</span></div>
-            <div class="flex items-center justify-between border-b border-line pb-4"><span class="text-slate-400">Trade permission</span><span class="font-medium text-emerald-300">Spot only</span></div>
-            <div class="flex items-center justify-between border-b border-line pb-4"><span class="text-slate-400">Withdrawal access</span><span class="font-medium text-emerald-300">Disabled</span></div>
-            <div class="flex items-center justify-between"><span class="text-slate-400">Last update</span><span class="font-medium text-slate-300" id="updatedAt">Loading</span></div>
-          </div>
-          <div class="mt-8 rounded-xl border border-cyan/20 bg-cyan/5 p-4 text-sm leading-6 text-slate-300">The Risk Guardian blocks proposals that exceed the available USDT balance. Approval is still a human action.</div>
-          <div class="mt-5 text-xs text-rose-300" id="error"></div>
-        </aside>
-      </section>
-    </main>
-
-    <script>
-      let currentProposalId = null;
-      let approving = false;
-
-      function setText(id, value) { document.getElementById(id).textContent = value; }
-
-      function render(data) {
-        const market = data.marketData;
-        if (market) {
-          setText('price', '$' + Number(market.price).toFixed(2));
-          setText('symbol', market.symbol);
-          setText('change', (market.priceChangePercent >= 0 ? '+' : '') + Number(market.priceChangePercent).toFixed(2) + '%');
-          document.getElementById('change').className = 'text-sm font-medium ' + (market.priceChangePercent >= 0 ? 'text-emerald-300' : 'text-rose-300');
-          setText('range', '$' + Number(market.lowPrice).toFixed(2) + ' / $' + Number(market.highPrice).toFixed(2));
-          setText('volume', Number(market.volume).toLocaleString());
-          setText('marketTime', new Date(market.timestamp).toLocaleTimeString());
-        }
-
-        setText('sales', String(data.reportSales));
-        setText('reportPrice', Number(data.reportPrice).toFixed(2) + ' USDC');
-        setText('event', data.lastEvent);
-        setText('updatedAt', new Date(data.updatedAt).toLocaleTimeString());
-        setText('error', data.lastError ? 'Binance data warning: ' + data.lastError : '');
-
-        const badge = document.getElementById('riskBadge');
-        const badgeLabel = data.riskStatus === 'refused' ? 'RISK GUARDIAN: refused' : 'RISK GUARDIAN: ' + data.riskStatus;
-        badge.innerHTML = '<span class="h-2 w-2 rounded-full"></span> ' + badgeLabel;
-        badge.className = 'inline-flex w-fit items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold uppercase tracking-wide ' + (data.riskStatus === 'refused' ? 'border-rose-400/40 bg-rose-400/10 text-rose-300' : data.riskStatus === 'approved' || data.riskStatus === 'filled' ? 'border-emerald-400/40 bg-emerald-400/10 text-emerald-300' : 'border-slate-600 bg-slate-800/40 text-slate-400');
-        badge.querySelector('span').className = 'h-2 w-2 rounded-full ' + (data.riskStatus === 'refused' ? 'bg-rose-400' : data.riskStatus === 'approved' || data.riskStatus === 'filled' ? 'bg-emerald-400' : 'bg-slate-500');
-
-        const proposal = data.tradeProposal;
-        const empty = document.getElementById('proposalEmpty');
-        const card = document.getElementById('proposalCard');
-        const button = document.getElementById('approveButton');
-        if (!proposal) {
-          empty.classList.remove('hidden');
-          card.classList.add('hidden');
-          currentProposalId = null;
-          return;
-        }
-
-        empty.classList.add('hidden');
-        card.classList.remove('hidden');
-        currentProposalId = proposal.proposalId;
-        setText('proposalAsset', proposal.asset);
-        setText('proposalSide', proposal.side);
-        setText('proposalAmount', '$' + Number(proposal.amountUSDT).toFixed(2) + ' USDT');
-        setText('proposalBalance', '$' + Number(proposal.balanceUSDT).toFixed(2) + ' USDT');
-        setText('proposalReason', proposal.reason || 'Proposal received.');
-        button.disabled = approving || proposal.status !== 'pending';
-        button.textContent = proposal.status === 'pending' ? 'Approve trade' : proposal.status === 'filled' ? 'Trade FILLED!' : proposal.status.toUpperCase();
-      }
-
-      async function refresh() {
-        try {
-          const response = await fetch('/api/dashboard/state');
-          if (!response.ok) throw new Error('Dashboard state request failed');
-          render(await response.json());
-          setText('connection', 'LIVE');
-        } catch (error) {
-          setText('connection', 'RECONNECTING');
-        }
-      }
-
-      async function approveTrade() {
-        if (!currentProposalId || approving) return;
-        approving = true;
-        try {
-          await fetch('/api/trade/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proposalId: currentProposalId }) });
-          await refresh();
-        } finally {
-          approving = false;
-        }
-      }
-
-      document.getElementById('approveButton').addEventListener('click', approveTrade);
-      refresh();
-      setInterval(refresh, 2000);
-    </script>
-  </body>
-</html>`;
+function receiptHeader(receipt: SettlementReceipt): string {
+  return Buffer.from(JSON.stringify({
+    success: true,
+    txHash: receipt.transaction,
+    transaction: receipt.transaction,
+    payer: receipt.payer,
+    network: receipt.network,
+    amount: receipt.amount,
+  }), 'utf8').toString('base64');
+}
 
 app.get('/', (_req, res) => {
-  res.type('html').send(dashboardHtml);
+  res.type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Signal402 Agent OS</title><script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={theme:{extend:{colors:{ink:'#070b14',panel:'#0d1422',line:'#1d2a3d',cyan:'#67e8f9',lime:'#bef264'}}}}</script>
+<style>body{background:#070b14;color:#e5edf7;font-family:Inter,ui-sans-serif,system-ui}.glow{box-shadow:0 0 36px rgba(34,211,238,.10)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}</style></head>
+<body><main class="mx-auto min-h-screen max-w-7xl px-5 py-8 lg:px-10">
+<header class="mb-8 flex flex-col gap-5 border-b border-line pb-6 sm:flex-row sm:items-end sm:justify-between">
+<div><div class="mb-2 flex items-center gap-3"><span class="rounded-full border border-cyan/30 bg-cyan/10 px-3 py-1 text-xs font-bold tracking-[.25em] text-cyan">SIGNAL402</span><span class="text-xs uppercase tracking-[.22em] text-slate-500">Binance Agent OS</span></div><h1 class="text-3xl font-semibold tracking-tight sm:text-5xl">Agent-to-agent market intelligence</h1><p class="mt-3 max-w-2xl text-sm leading-6 text-slate-400">A live Seller Agent publishes a paid Binance briefing. A Buyer Agent checks its real account, waits for human approval, then submits one capped Spot order.</p></div>
+<div class="flex flex-wrap gap-2 text-xs font-semibold"><span id="mcpBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">MCP: CONNECTING</span><span id="sourceBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">DATA: WAITING</span><span class="rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-rose-300">WITHDRAWAL: NEVER</span></div>
+</header>
+<section class="grid gap-5 lg:grid-cols-[1.1fr_.9fr]">
+<article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-cyan">Seller Agent</p><h2 class="mt-2 text-2xl font-semibold">Analyst Agent</h2></div><span class="rounded-lg border border-cyan/20 bg-cyan/10 px-3 py-2 text-xs text-cyan">LIVE FEED</span></div><div class="grid gap-4 sm:grid-cols-3"><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Pair</p><p id="pair" class="mt-2 text-xl font-semibold">${SYMBOL}</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Last price</p><p id="price" class="mt-2 text-xl font-semibold text-lime">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">24h change</p><p id="change" class="mt-2 text-xl font-semibold">Waiting</p></div></div><div class="mt-5 rounded-xl border border-line bg-ink p-4"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Research paywall</span><span class="text-sm font-semibold text-cyan">0.01 USDC</span></div><p class="mt-3 text-sm leading-6 text-slate-400">Real Binance B402 v2 settlement. The briefing is withheld until verification and on-chain settlement succeed.</p><p id="paymentReceipt" class="mt-3 break-all font-mono text-xs text-slate-500">Receipt: waiting</p></div></article>
+<article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Buyer Agent</p><h2 class="mt-2 text-2xl font-semibold">Trader Agent</h2></div><span class="rounded-lg border border-lime/20 bg-lime/10 px-3 py-2 text-xs text-lime">HUMAN GATE</span></div><div class="rounded-xl border border-line bg-ink p-5"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Risk Guardian</span><span id="riskBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-400">idle</span></div><p id="riskReason" class="mt-4 text-sm leading-6 text-slate-400">Waiting for a buyer proposal backed by a live balance read.</p><div class="mt-5 grid grid-cols-2 gap-3 text-sm"><div><p class="text-xs text-slate-500">Proposed size</p><p id="tradeSize" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT available</p><p id="balance" class="mt-1 font-semibold">Waiting</p></div></div><button id="approve" class="mt-6 hidden w-full rounded-xl bg-lime px-4 py-3 text-sm font-bold text-ink transition hover:bg-lime/80">APPROVE</button><p id="order" class="mt-4 break-all font-mono text-xs text-slate-500">Order: waiting</p></div></article>
+</section>
+<section class="mt-5 grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><article class="rounded-2xl border border-line bg-panel p-6"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Safety model</p><div class="mt-4 space-y-3 text-sm text-slate-300"><p>✓ OAuth token cache is local and gitignored.</p><p>✓ No withdrawal scope exists in Binance Agent OS.</p><p>✓ Every order requires this human APPROVE action.</p><p>✓ Spot MARKET BUY is capped at 10 USDT.</p><p>✓ Every action is appended to a local JSONL audit log.</p></div></article><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Agent activity</p><span id="updated" class="font-mono text-xs text-slate-600">waiting</span></div><div id="activity" class="mono mt-4 max-h-56 space-y-2 overflow-auto text-xs leading-5 text-slate-400"><p>Waiting for the Seller Agent.</p></div></article></section>
+</main><script>
+const esc=(v)=>String(v??'').replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const set=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value};
+async function approve(id){const b=document.getElementById('approve');b.disabled=true;b.textContent='APPROVING';await fetch('/api/trade/approve',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({proposalId:id})});await update()}
+async function update(){try{const s=await (await fetch('/api/state',{cache:'no-store'})).json();set('mcpBadge',s.mcpStatus==='live'?'MCP: LIVE':s.mcpStatus==='error'?'MCP: ERROR':'MCP: CONNECTING');set('sourceBadge',s.marketSource==='MCP'?'DATA: MCP LIVE':s.marketSource==='FALLBACK'?'DATA: FALLBACK':'DATA: WAITING');if(s.ticker){set('pair',s.ticker.symbol);set('price',Number(s.ticker.price).toFixed(8)+' USDT');set('change',Number.isFinite(Number(s.ticker.changePercent))?Number(s.ticker.changePercent).toFixed(2)+'%':'Unavailable')}set('paymentReceipt',s.paymentReceiptId?'Receipt: '+s.paymentReceiptId:'Receipt: waiting');set('updated',new Date(s.updatedAt).toLocaleTimeString());const p=s.proposal;const badge=document.getElementById('riskBadge');const button=document.getElementById('approve');if(p){set('riskBadge',p.status==='refused'?'RISK GUARDIAN: refused':p.status==='filled'?'TRADE FILLED':p.status==='approved'?'APPROVED':p.status.toUpperCase());badge.className='rounded-full border px-3 py-1 text-xs '+(p.status==='refused'?'border-rose-500/40 bg-rose-500/10 text-rose-300':p.status==='filled'?'border-lime/40 bg-lime/10 text-lime':'border-cyan/40 bg-cyan/10 text-cyan');set('riskReason',p.reason);set('tradeSize',Number(p.amountUSDT).toFixed(2)+' USDT');set('balance',Number(p.balanceUSDT).toFixed(2)+' USDT');set('order',p.orderId?'Order: '+p.orderId+(p.filledPrice?' · filled price '+Number(p.filledPrice).toFixed(8):''):'Order: waiting');if(p.status==='pending'){button.classList.remove('hidden');button.disabled=false;button.textContent='APPROVE';button.onclick=()=>approve(p.proposalId)}else{button.classList.add('hidden')}}else{button.classList.add('hidden')}const a=document.getElementById('activity');a.innerHTML=(s.activity||[]).map((x)=>'<p>'+esc(x)+'</p>').join('')||'<p>Waiting for the Seller Agent.</p>'}catch(e){console.error(e)}}update();setInterval(update,1500);
+</script></body></html>`);
 });
 
-app.get('/api/dashboard/state', async (_req, res) => {
-  await refreshMarketData();
-  res.json({ ...dashboardState, reportPrice: REPORT_PRICE_USDC });
+app.get('/api/state', (_req, res) => res.json(publicState()));
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, mcp: state.mcpStatus === 'live', marketSource: state.marketSource, x402Configured: b402IsConfigured() }));
+
+app.get('/api/report/info', (_req, res) => res.json({
+  service: 'Signal402 Seller Agent',
+  price: reportPriceUsdc(),
+  currency: 'USDC',
+  payment_protocol: 'Binance B402 x402 v2',
+  network: process.env.B402_NETWORK ?? 'eip155:56',
+  payment_required_header: 'PAYMENT-REQUIRED',
+  settlement_endpoints: ['/papi/v2/b402/verify', '/papi/v2/b402/settle'],
+}));
+
+app.post('/api/report', async (req, res) => {
+  const resourceUrl = `${PUBLIC_BASE_URL}/api/report`;
+  try {
+    const required = await buildPaymentRequired(resourceUrl);
+    const signedPayment = paymentHeader(req);
+    if (!signedPayment) {
+      touch('402 challenge issued. No briefing delivered.');
+      sendPaymentChallenge(res, required);
+      return;
+    }
+    const receipt = await verifyAndSettlePayment(signedPayment, required.requirement);
+    if (!state.ticker) await refreshMarketData();
+    if (!state.ticker || state.marketSource === 'UNAVAILABLE') throw new Error('No live market data is available after payment settlement');
+    const text = briefing();
+    const paymentResponse = receiptHeader(receipt);
+    state.reportsSold += 1;
+    state.paymentReceiptId = receipt.transaction;
+    state.paymentStatus = 'settled';
+    touch(`x402 settled. Briefing delivered. Receipt ${receipt.transaction}`);
+    await audit('seller.briefing.delivered', { receiptId: receipt.transaction, source: state.marketSource, symbol: state.symbol });
+    res.setHeader('PAYMENT-RESPONSE', paymentResponse);
+    res.json({ success: true, briefing: text, paymentReceiptId: receipt.transaction, payment: receipt, marketSource: state.marketSource });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    state.paymentStatus = 'error';
+    state.lastError = message;
+    touch(`Payment or briefing refused: ${message}`);
+    await audit('seller.briefing.refused', { error: message });
+    if (message.includes('credentials are missing')) {
+      res.status(503).json({ success: false, error: 'Real B402 merchant credentials are not configured. No simulated payment is accepted.' });
+      return;
+    }
+    res.status(402).json({ success: false, error: message });
+  }
 });
 
-app.post('/api/trade/proposal', (req, res) => {
+app.post('/api/trade/proposal', async (req, res) => {
   const body = req.body as Partial<TradeProposal>;
-  const amountUSDT = Number(body.amountUSDT);
-  const balanceUSDT = Number(body.balanceUSDT);
-  const side = body.side === 'SELL' ? 'SELL' : 'BUY';
-
-  if (!body.asset || !Number.isFinite(amountUSDT) || !Number.isFinite(balanceUSDT)) {
-    res.status(400).json({ error: 'asset, amountUSDT and balanceUSDT are required' });
+  const amount = Number(body.amountUSDT);
+  const balance = Number(body.balanceUSDT);
+  if (!body.proposalId || !body.asset || !Number.isFinite(amount) || amount <= 0 || amount > MAX_TRADE_SIZE_USDT || !Number.isFinite(balance)) {
+    res.status(400).json({ success: false, error: `Invalid proposal. Maximum allowed size is ${MAX_TRADE_SIZE_USDT} USDT.` });
     return;
   }
-
-  const now = new Date().toISOString();
   const proposal: TradeProposal = {
-    proposalId: body.proposalId || `proposal_${Date.now()}`,
-    asset: body.asset,
-    side,
-    amountUSDT,
-    balanceUSDT,
-    status: 'pending',
-    reason: body.reason || 'Risk Guardian approved the available balance.',
-    createdAt: now,
-    updatedAt: now,
+    proposalId: `${body.proposalId}`,
+    asset: `${body.asset}`.toUpperCase(),
+    side: 'BUY',
+    amountUSDT: amount,
+    balanceUSDT: balance,
+    reason: `${body.reason ?? 'Live balance covers the capped order.'}`,
+    status: body.status === 'refused' ? 'refused' : 'pending',
+    riskStatus: body.riskStatus === 'refused' || body.status === 'refused' ? 'refused' : 'approved',
+    paymentReceiptId: typeof body.paymentReceiptId === 'string' ? body.paymentReceiptId : state.paymentReceiptId,
+    updatedAt: new Date().toISOString(),
   };
-
-  proposals.set(proposal.proposalId, proposal);
-  dashboardState.tradeProposal = proposal;
-  dashboardState.riskStatus = 'approved';
-  touchState(`Trade proposal received for ${proposal.side} ${proposal.asset}`);
-  res.status(201).json(proposal);
+  state.proposal = proposal;
+  touch(`Trade proposal ${proposal.proposalId} is waiting for human APPROVE.`);
+  await audit('seller.trade.proposed', { proposalId: proposal.proposalId, asset: proposal.asset, amountUSDT: amount, balanceUSDT: balance });
+  res.json({ success: true, proposalId: proposal.proposalId, status: proposal.status });
 });
 
 app.get('/api/trade/proposal/:proposalId', (req, res) => {
-  const proposal = proposals.get(req.params.proposalId);
-  if (!proposal) {
-    res.status(404).json({ error: 'Proposal not found' });
+  const proposal = state.proposal;
+  if (!proposal || proposal.proposalId !== req.params.proposalId) {
+    res.status(404).json({ success: false, error: 'Proposal not found' });
     return;
   }
   res.json(proposal);
 });
 
-app.post('/api/trade/approve', (req, res) => {
-  const proposalId = String(req.body?.proposalId || '');
-  const proposal = proposals.get(proposalId);
-  if (!proposal) {
-    res.status(404).json({ error: 'Proposal not found' });
+app.post('/api/trade/approve', async (req, res) => {
+  const proposal = state.proposal;
+  if (!proposal || proposal.proposalId !== req.body?.proposalId) {
+    res.status(404).json({ success: false, error: 'Proposal not found' });
     return;
   }
   if (proposal.status !== 'pending') {
-    res.status(409).json({ error: `Proposal is already ${proposal.status}`, proposal });
+    res.status(409).json({ success: false, error: `Proposal is already ${proposal.status}` });
     return;
   }
-
   proposal.status = 'approved';
   proposal.updatedAt = new Date().toISOString();
-  dashboardState.tradeProposal = proposal;
-  dashboardState.riskStatus = 'approved';
-  touchState(`Human approved ${proposal.side} ${proposal.asset}`);
-  res.json(proposal);
+  touch(`Human APPROVE received for ${proposal.proposalId}. Buyer may submit one capped Spot order.`);
+  await audit('seller.trade.approved', { proposalId: proposal.proposalId, amountUSDT: proposal.amountUSDT });
+  res.json({ success: true, status: proposal.status });
 });
 
-app.post('/api/trade/status', (req, res) => {
-  const body = req.body as Partial<TradeProposal> & { riskStatus?: RiskStatus };
-  let proposal = body.proposalId ? proposals.get(body.proposalId) : undefined;
-
-  if (!proposal && body.riskStatus === 'refused') {
-    const now = new Date().toISOString();
-    proposal = {
-      proposalId: body.proposalId || `risk_${Date.now()}`,
-      asset: body.asset || 'BNBUSDT',
-      side: body.side === 'SELL' ? 'SELL' : 'BUY',
-      amountUSDT: Number(body.amountUSDT) || 0,
-      balanceUSDT: Number(body.balanceUSDT) || 0,
-      status: 'refused',
-      reason: body.reason || 'Risk Guardian refused the trade.',
-      createdAt: now,
-      updatedAt: now,
-    };
-    proposals.set(proposal.proposalId, proposal);
-  }
-
-  if (!proposal) {
-    res.status(404).json({ error: 'Proposal not found' });
+app.post('/api/trade/status', async (req, res) => {
+  const body = req.body as Partial<TradeProposal>;
+  const proposal = state.proposal;
+  if (!proposal || proposal.proposalId !== body.proposalId) {
+    res.status(404).json({ success: false, error: 'Proposal not found' });
     return;
   }
-
-  if (body.status && ['approved', 'refused', 'filled', 'cancelled'].includes(body.status)) {
-    proposal.status = body.status as TradeStatus;
+  const nextStatus = body.status;
+  if (!['refused', 'filled', 'cancelled'].includes(`${nextStatus}`)) {
+    res.status(400).json({ success: false, error: 'Invalid trade status' });
+    return;
   }
-  if (body.reason) proposal.reason = body.reason;
+  if (nextStatus === 'filled' && (!body.orderId || `${body.orderId}`.trim() === '')) {
+    res.status(400).json({ success: false, error: 'A real Binance order ID is required for filled status' });
+    return;
+  }
+  proposal.status = nextStatus as ProposalStatus;
+  proposal.riskStatus = nextStatus === 'refused' ? 'refused' : 'approved';
+  proposal.reason = `${body.reason ?? proposal.reason}`;
+  proposal.orderId = typeof body.orderId === 'string' ? body.orderId : proposal.orderId;
+  proposal.filledPrice = Number.isFinite(Number(body.filledPrice)) ? Number(body.filledPrice) : proposal.filledPrice;
+  proposal.beforeBalances = body.beforeBalances ?? proposal.beforeBalances;
+  proposal.afterBalances = body.afterBalances ?? proposal.afterBalances;
   proposal.updatedAt = new Date().toISOString();
-  dashboardState.tradeProposal = proposal;
-  dashboardState.riskStatus = proposal.status === 'refused' ? 'refused' : proposal.status === 'filled' ? 'filled' : proposal.status === 'cancelled' ? 'cancelled' : 'approved';
-  touchState(proposal.status === 'refused' ? `RISK GUARDIAN: refused ${proposal.reason}` : proposal.status === 'filled' ? 'Trade FILLED!' : `Trade status: ${proposal.status}`);
-  res.json(proposal);
+  touch(nextStatus === 'filled' ? `REAL TRADE FILLED. Order ${proposal.orderId}` : `Trade ${nextStatus}: ${proposal.reason}`);
+  await audit(`seller.trade.${nextStatus}`, { proposalId: proposal.proposalId, orderId: proposal.orderId, filledPrice: proposal.filledPrice, beforeBalances: proposal.beforeBalances, afterBalances: proposal.afterBalances });
+  res.json({ success: true, status: proposal.status, orderId: proposal.orderId });
 });
 
-// x402 payment endpoint for a live market briefing.
-app.post('/api/report', async (req, res) => {
-  try {
-    const paymentHeader = req.headers['x-x402-payment'] as string | undefined;
-    if (!paymentHeader) {
-      res.setHeader('X-Payment-Required', 'true');
-      res.setHeader('X-Payment-Amount', REPORT_PRICE_USDC.toString());
-      res.setHeader('X-Payment-Currency', 'USDC');
-      res.setHeader('X-Payment-Network', 'base');
-      res.setHeader('X-Payment-Resource', '/api/report');
-      res.status(402).json({
-        error: 'Payment Required',
-        message: `This endpoint requires payment of ${REPORT_PRICE_USDC} USDC via Binance x402`,
-        payment_details: { amount: REPORT_PRICE_USDC, currency: 'USDC', network: 'base', protocol: 'x402' },
-      });
-      return;
-    }
-
-    console.log('Verifying x402 payment:', paymentHeader.substring(0, 20) + '...');
-    const marketData = await fetchMarketData();
-    dashboardState.marketData = marketData;
-    dashboardState.reportSales += 1;
-    touchState('Analyst Agent sold a live Binance briefing');
-    console.log('x402 payment verified. Report sold successfully');
-
-    res.json({
-      success: true,
-      briefing: generateBriefing(marketData),
-      metadata: { generated_at: marketData.timestamp, price_paid: REPORT_PRICE_USDC, currency: 'USDC', payment_verified: true },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown report error';
-    console.error('Error generating report:', message);
-    res.status(500).json({ error: 'Failed to generate report', message });
-  }
+const server = app.listen(PORT, () => {
+  console.log(`\n📡 Signal402 Seller Agent listening on http://localhost:${PORT}`);
+  console.log(`   Pair: ${SYMBOL}`);
+  console.log(`   MCP: ${process.env.BINANCE_MCP_URL ?? 'https://agent.binance.com/mcp/agentic'}`);
+  console.log(`   x402: ${b402IsConfigured() ? 'B402 credentials detected' : 'NOT CONFIGURED. Real payments only.'}`);
+  console.log(`   Public REST fallback: ${ALLOW_PUBLIC_REST_FALLBACK ? 'ENABLED AND LABELLED' : 'DISABLED'}`);
+  void refreshMarketData();
 });
 
-app.get('/api/report/info', (_req, res) => {
-  res.json({
-    service: 'Signal402 Market Intelligence',
-    description: 'AI-generated market briefings powered by Binance public market data',
-    price: REPORT_PRICE_USDC,
-    currency: 'USDC',
-    payment_protocol: 'x402',
-    endpoint: '/api/report',
-    method: 'POST',
-  });
-});
+const refreshTimer = setInterval(() => { void refreshMarketData(); }, 15_000);
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'Signal402 Seller Agent' });
-});
+async function shutdown(): Promise<void> {
+  clearInterval(refreshTimer);
+  await mcp.close();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
 
-app.listen(PORT, () => {
-  console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║              SIGNAL402 SELLER AGENT STARTED               ║
-╚═══════════════════════════════════════════════════════════╝
-
-📡 Dashboard: http://localhost:${PORT}/
-💰 Price per Report: ${REPORT_PRICE_USDC} USDC (x402)
-📊 Report API: http://localhost:${PORT}/api/report
-✅ Health: http://localhost:${PORT}/health
-
-Waiting for Buyer Agents to purchase reports...
-  `);
-});
+process.once('SIGINT', () => { void shutdown().finally(() => process.exit(0)); });
+process.once('SIGTERM', () => { void shutdown().finally(() => process.exit(0)); });

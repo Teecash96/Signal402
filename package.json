@@ -10,7 +10,7 @@
     "start:buyer": "npx tsx src/buyer/index.ts",
     "dev:seller": "npx tsx watch src/seller/index.ts",
     "dev:buyer": "npx tsx watch src/buyer/index.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --import tsx --test test/**/*.test.ts"
   },
   "keywords": [
     "binance",

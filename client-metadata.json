@@ -1,0 +1,8 @@
+{
+  "client_id": "https://raw.githubusercontent.com/Teecash96/Signal402/main/client-metadata.json",
+  "client_name": "Signal402 Binance Agent OS client",
+  "redirect_uris": ["http://localhost:8765/oauth/callback"],
+  "grant_types": ["authorization_code"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}

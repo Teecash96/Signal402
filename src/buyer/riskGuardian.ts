@@ -1,3 +1,5 @@
+import { extractUsdtBalance, type BinanceBalance, type BinanceMcpClient } from '../lib/binanceMcp.js';
+
 export interface RiskAssessment {
   approved: boolean;
   balanceUSDT: number;
@@ -5,12 +7,12 @@ export interface RiskAssessment {
   reason: string;
 }
 
-/**
- * Check the simulated USDT balance before a trade proposal is sent.
- *
- * The demo deliberately uses DEMO_BALANCE_USDT so the safety path can be
- * reproduced without connecting an exchange account or risking real funds.
- */
+export interface LiveRiskCheck {
+  assessment: RiskAssessment;
+  balances: BinanceBalance[];
+}
+
+/** Check the live USDT balance before a trade proposal is sent. */
 export function assessTradeRisk(
   balanceUSDT: number,
   proposedSizeUSDT: number,
@@ -50,7 +52,12 @@ export function assessTradeRisk(
   };
 }
 
-export function readDemoBalanceUSDT(): number {
-  const configuredBalance = Number.parseFloat(process.env.DEMO_BALANCE_USDT ?? '10');
-  return Number.isFinite(configuredBalance) ? configuredBalance : 0;
+/** Read Binance through MCP and apply the refusal rule to the returned USDT balance. */
+export async function assessLiveTradeRisk(
+  client: BinanceMcpClient,
+  proposedSizeUSDT: number,
+): Promise<LiveRiskCheck> {
+  const balances = await client.getBalances();
+  const balanceUSDT = extractUsdtBalance(balances);
+  return { assessment: assessTradeRisk(balanceUSDT, proposedSizeUSDT), balances };
 }
