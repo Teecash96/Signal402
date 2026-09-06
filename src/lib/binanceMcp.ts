@@ -1,6 +1,7 @@
 import { createServer, type Server } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -8,6 +9,8 @@ import { UnauthorizedError, type OAuthClientProvider, type OAuthDiscoveryState }
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { audit } from './audit.js';
+import { decryptText, encryptText } from './cryptoStore.js';
+import { isUsableSecret } from './securityConfig.js';
 
 export const BINANCE_AGENTIC_MCP_URL = process.env.BINANCE_MCP_URL ?? 'https://agent.binance.com/mcp/agentic';
 export const MCP_CALLBACK_PORT = Number.parseInt(process.env.MCP_CALLBACK_PORT ?? '8765', 10);
@@ -89,7 +92,12 @@ class FileOAuthProvider implements OAuthClientProvider {
     this.loaded = true;
     try {
       const contents = await readFile(this.tokenFile, 'utf8');
-      this.store = JSON.parse(contents) as TokenStore;
+      const secret = process.env.MCP_TOKEN_ENCRYPTION_KEY;
+      if (!isUsableSecret(secret, 16)) throw new Error('MCP_TOKEN_ENCRYPTION_KEY is required to unlock the encrypted OAuth cache');
+      if (contents.trimStart().startsWith('{')) {
+        throw new Error('Refusing a plaintext OAuth token cache. Delete the old token file and set MCP_TOKEN_ENCRYPTION_KEY before signing in again.');
+      }
+      this.store = JSON.parse(decryptText(contents, secret)) as TokenStore;
     } catch (error: unknown) {
       const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
       if (code !== 'ENOENT') throw error;
@@ -97,7 +105,11 @@ class FileOAuthProvider implements OAuthClientProvider {
   }
 
   private async save(): Promise<void> {
-    await writeFile(this.tokenFile, `${JSON.stringify(this.store, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    const secret = process.env.MCP_TOKEN_ENCRYPTION_KEY;
+    if (!isUsableSecret(secret, 16)) throw new Error('MCP_TOKEN_ENCRYPTION_KEY is required to save the encrypted OAuth cache');
+    await mkdir(dirname(this.tokenFile), { recursive: true, mode: 0o700 });
+    await writeFile(this.tokenFile, `${encryptText(JSON.stringify(this.store), secret)}\n`, { encoding: 'utf8', mode: 0o600 });
+    await chmod(this.tokenFile, 0o600);
   }
 
   public get redirectUrl(): string {
@@ -293,6 +305,9 @@ export class BinanceMcpClient {
   private async connectInternal(): Promise<void> {
     if (process.env.SIGNAL402_BINANCE_MODE !== 'direct' || process.env.BINANCE_MCP_CLIENT_APPROVED !== 'true') {
       throw new Error('Direct Binance MCP OAuth is disabled. Use the supported Binance MCP host. Set SIGNAL402_BINANCE_MODE=direct and BINANCE_MCP_CLIENT_APPROVED=true only after Binance approves this client.');
+    }
+    if (!isUsableSecret(process.env.MCP_TOKEN_ENCRYPTION_KEY, 16)) {
+      throw new Error('MCP_TOKEN_ENCRYPTION_KEY is required. OAuth tokens are never cached in plaintext.');
     }
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {

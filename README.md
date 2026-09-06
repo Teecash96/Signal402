@@ -25,11 +25,19 @@ The Binance MCP account and the B402 wallet are different Binance products. The 
 
    Copy the printed value into the `SIGNAL402_HOST_TOKEN` line in `.env`.
 
-3. Apply for Binance B402 merchant credentials. Binance gives the production base URL, `clientId`, `accessToken`, and the Base64 PKCS#8 RSA private key after onboarding. Set them in `.env`, together with a seller BSC address in `B402_PAY_TO`. This repository refuses to issue a fake challenge when these values are missing.
+3. Create the dashboard password hash without putting the password in shell history.
 
-4. Install and log in to the Binance Agentic Wallet CLI. The executable must be available as `baw`, or set `BINANCE_AGENTIC_WALLET_BIN` to its path. The payment tool uses the documented `baw x402-payment preview` and `baw x402-payment sign` commands.
+   ```sh
+   npm run hash:dashboard-password
+   ```
 
-5. Start the Seller.
+   Copy the printed `SIGNAL402_DASHBOARD_PASSWORD_HASH` line into `.env`. Set `SIGNAL402_DASHBOARD_SESSION_SECRET` and `MCP_TOKEN_ENCRYPTION_KEY` to separate random values. The dashboard approval route has a server side session, secure cookie settings, a five failure login limit, and a honeypot. Set the optional Cloudflare Turnstile keys to add challenge verification.
+
+4. Apply for Binance B402 merchant credentials. Binance gives the production base URL, `clientId`, `accessToken`, and the Base64 PKCS#8 RSA private key after onboarding. Set them in `.env`, together with a seller BSC address in `B402_PAY_TO`. This repository refuses to issue a fake challenge when these values are missing.
+
+5. Install and log in to the Binance Agentic Wallet CLI. The executable must be available as `baw`, or set `BINANCE_AGENTIC_WALLET_BIN` to its path. The payment tool uses the documented `baw x402-payment preview` and `baw x402-payment sign` commands.
+
+6. Start the Seller.
 
    ```sh
    npm run start:seller
@@ -37,7 +45,7 @@ The Binance MCP account and the B402 wallet are different Binance products. The 
 
    The Seller does not authenticate to Binance in host mode. The supported MCP host performs Binance login and asks for Market data, Account, and Trade scopes for the Agentic subaccount. Do not grant a transfer scope. Binance Agent OS does not provide a withdrawal scope.
 
-6. Add two MCP servers to a supported host such as Codex Desktop, Codex CLI, Claude, Cursor, or ChatGPT. Binance owns the OAuth flow. Signal402 does not open a custom OAuth page or store Binance tokens.
+7. Add two MCP servers to a supported host such as Codex Desktop, Codex CLI, Claude, Cursor, or ChatGPT. Binance owns the OAuth flow. Signal402 does not open a custom OAuth page or store Binance tokens.
 
    Binance MCP:
 
@@ -51,11 +59,11 @@ The Binance MCP account and the B402 wallet are different Binance products. The 
    codex mcp add signal402-agent --env SIGNAL402_HOST_TOKEN=$SIGNAL402_HOST_TOKEN --env SELLER_ENDPOINT_URL=http://localhost:3001 -- npx tsx "$PWD/src/agent/server.ts"
    ```
 
-7. Open [http://localhost:3001](http://localhost:3001). The header must show `MCP: LIVE` after the host publishes a live ticker. `DATA: FALLBACK` is allowed only when `ALLOW_PUBLIC_REST_FALLBACK=true` and is clearly labelled.
+8. Open [http://localhost:3001](http://localhost:3001). Sign in with the dashboard password. The header must show `MCP: LIVE` after the host publishes a live ticker. `DATA: FALLBACK` is allowed only when `ALLOW_PUBLIC_REST_FALLBACK=true` and is clearly labelled.
 
-8. Fund the Agentic subaccount with USDT using the Binance web UI. The documented path is Profile, Dashboard, Subaccount, Asset Management, Transfer. Keep at least 10 USDT available for the capped Spot order.
+9. Fund the Agentic subaccount with USDT using the Binance web UI. The documented path is Profile, Dashboard, Subaccount, Asset Management, Transfer. Keep at least 10 USDT available for the capped Spot order.
 
-9. In the supported host, call `signal402_get_workflow` and follow the returned workflow. The host discovers Binance tool names at runtime, reads market data and balances, pays the real 0.01 USDC challenge after human confirmation, creates the proposal, waits for the dashboard `APPROVE`, submits one real MARKET BUY capped at 10 USDT, reads the real fill and balances, and records the receipt.
+10. In the supported host, call `signal402_get_workflow` and follow the returned workflow. The host discovers Binance tool names at runtime, reads market data and balances, pays the real 0.01 USDC challenge after human confirmation, creates the proposal, waits for the dashboard `APPROVE`, submits one real MARKET BUY capped at 10 USDT, reads the real fill and balances, and records the receipt.
 
 The full agent contract is in [`SIGNAL402_AGENT.md`](./SIGNAL402_AGENT.md). Load it in the supported host before enabling trading.
 
@@ -92,9 +100,17 @@ The signed response supplies a `PAYMENT-SIGNATURE` header. The Buyer replays the
 
 ## Safety model
 
-No withdrawal permission is requested or available. Binance OAuth tokens remain inside the supported MCP host and are never handled by Signal402. The order is always a Spot `MARKET BUY`, never larger than 10 USDT, and requires the dashboard `APPROVE` action. The host checks real USDT immediately before proposal and again immediately before order. It reads balances after the order and refuses to call the dashboard `filled` state unless Binance returns a real order ID and filled price. Every material action is appended to `logs/signal402.jsonl`; the log is ignored by Git.
+No withdrawal permission is requested or available. In supported host mode, Binance OAuth tokens remain inside the supported MCP host and are never handled by Signal402. The isolated direct client is disabled unless Binance approves it and stores only an encrypted token cache. The order is always a Spot `MARKET BUY`, never larger than 10 USDT, and requires the dashboard `APPROVE` action. The host checks real USDT immediately before proposal and again immediately before order. It reads balances after the order and refuses to call the dashboard `filled` state unless Binance returns a real order ID and filled price. Every material action is appended to `logs/signal402.jsonl`; the log is ignored by Git.
 
 For a refusal test, use a real account with less than the proposed amount. Do not set a fake balance variable. If the live balance is too low, the dashboard shows the red `RISK GUARDIAN: refused` state and no order call is made.
+
+## Security controls
+
+Secrets stay in environment variables or the Binance host. The browser receives no API key, access token, private key, or wallet credential. If the approved direct client is used, its OAuth token state is encrypted with AES 256 GCM in `.mcp-tokens.json` and the file is ignored with mode `0600`. The local audit log is redacted by default and can encrypt its details with `SIGNAL402_AUDIT_ENCRYPTION_KEY`; production should set `SIGNAL402_REQUIRE_AUDIT_ENCRYPTION=true`.
+
+The Seller sends security headers, limits JSON bodies to 32 KB, restricts CORS to `SIGNAL402_ALLOWED_ORIGINS`, rejects unknown fields with Zod schemas, and returns trimmed state without raw MCP payloads. Dashboard state and approval require the dashboard session. Host market, proposal, status, and state writes require the bridge token. Trade status cannot be changed by editing a client field: the server checks the payment receipt, configured symbol, ten USDT cap, approval state, runtime MCP tool name, order fields, and before and after balance changes.
+
+Set `SIGNAL402_FORCE_HTTPS=true`, `SIGNAL402_COOKIE_SECURE=true`, and `SIGNAL402_TRUST_PROXY=true` only when a trusted TLS reverse proxy is in front of the Seller. Run `npm audit` before deployment. Signal402 has no database, SQL query layer, password table, or file upload endpoint, so public database keys, row level security, query parameterization, and upload validation are not applicable until those components are added.
 
 ## Configuration
 

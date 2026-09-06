@@ -66,9 +66,8 @@ async function baw<T>(args: string[]): Promise<T> {
     const parsed = parseJsonOutput(result.stdout) as BawEnvelope<T>;
     if (parsed.success === false) throw new Error(`baw rejected the request: ${JSON.stringify(parsed)}`);
     return (parsed.data ?? parsed) as T;
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Binance Agentic Wallet command failed (${BAW_BIN} ${args.join(' ')}): ${message}`);
+  } catch {
+    throw new Error(`Binance Agentic Wallet command failed (${BAW_BIN} ${args.slice(0, 2).join(' ')})`);
   }
 }
 

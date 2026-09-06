@@ -9,6 +9,7 @@
     "start:seller": "npx tsx src/seller/index.ts",
     "start:buyer": "npx tsx src/buyer/index.ts",
     "start:signal402-agent": "npx tsx src/agent/server.ts",
+    "hash:dashboard-password": "node scripts/hash-dashboard-password.mjs",
     "dev:seller": "npx tsx watch src/seller/index.ts",
     "dev:buyer": "npx tsx watch src/buyer/index.ts",
     "test": "node --import tsx --test test/**/*.test.ts"

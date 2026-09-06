@@ -8,10 +8,13 @@ import { z } from 'zod';
 import { assessTradeRisk } from '../buyer/riskGuardian.js';
 import { payReportChallenge, requestReportChallenge, type ReportPaymentChallenge } from '../lib/binanceX402Client.js';
 import { audit } from '../lib/audit.js';
+import { validateSellerEndpoint } from '../lib/endpointSecurity.js';
+import { isUsableSecret } from '../lib/securityConfig.js';
 
 dotenv.config({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../../.env') });
 
 const SELLER_ENDPOINT = process.env.SELLER_ENDPOINT_URL ?? 'http://localhost:3001';
+validateSellerEndpoint(SELLER_ENDPOINT);
 const HOST_TOKEN = process.env.SIGNAL402_HOST_TOKEN;
 const MAX_TRADE_SIZE_USDT = Math.min(Number.parseFloat(process.env.MAX_TRADE_SIZE_USDT ?? '10') || 10, 10);
 const APPROVAL_POLL_MS = Number.parseInt(process.env.APPROVAL_POLL_MS ?? '1000', 10);
@@ -56,7 +59,7 @@ function textResult(text: string) {
 }
 
 function requireHostToken(): string {
-  if (!HOST_TOKEN) {
+  if (!isUsableSecret(HOST_TOKEN)) {
     throw new Error('SIGNAL402_HOST_TOKEN is not configured. Refusing host bridge writes.');
   }
   return HOST_TOKEN;
@@ -197,19 +200,9 @@ server.registerTool('signal402_create_proposal', {
     side: 'BUY',
     amountUSDT,
     balanceUSDT,
-    riskStatus: assessment.approved ? 'approved' : 'refused',
-    status: assessment.approved ? 'pending' : 'refused',
-    reason: `${reason}. ${assessment.reason}`,
+    reason: `${reason}. ${assessment.reason}`.slice(0, 500),
     paymentReceiptId,
   });
-  if (!assessment.approved) {
-    await sellerRequest('post', '/api/trade/status', {
-      proposalId: id,
-      status: 'refused',
-      riskStatus: 'refused',
-      reason: assessment.reason,
-    });
-  }
   await audit('host.trade.proposal', { proposalId: id, asset: asset.toUpperCase(), amountUSDT, balanceUSDT, approved: assessment.approved });
   return jsonResult({ ...result, assessment, proposalId: id });
 });
@@ -261,10 +254,7 @@ server.registerTool('signal402_record_fill', {
   }
   const result = await sellerRequest<Record<string, unknown>>('post', '/api/trade/status', {
     proposalId,
-    asset: asset.toUpperCase(),
-    side: 'BUY',
     status: 'filled',
-    riskStatus: 'approved',
     orderId,
     filledPrice,
     executedQty,
@@ -283,8 +273,8 @@ server.registerTool('signal402_get_state', {
   title: 'Read the Seller dashboard state',
   description: 'Read current Signal402 state, including payment receipt, risk decision, approval, and real order receipt.',
 }, async () => {
-  const state = await axios.get<Record<string, unknown>>(`${SELLER_ENDPOINT.replace(/\/$/, '')}/api/state`, { timeout: 10_000 });
-  return jsonResult(state.data);
+  const state = await sellerRequest<Record<string, unknown>>('get', '/api/state');
+  return jsonResult(state);
 });
 
 async function main(): Promise<void> {

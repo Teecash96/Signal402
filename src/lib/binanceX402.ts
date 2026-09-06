@@ -1,6 +1,7 @@
 import { createPrivateKey, createSign } from 'node:crypto';
 import axios, { type AxiosRequestConfig } from 'axios';
 import { audit } from './audit.js';
+import { isUsableSecret } from './securityConfig.js';
 
 const REPORT_PRICE_USDC = Number.parseFloat(process.env.REPORT_PRICE_USDC ?? '0.01');
 const USDC_DECIMALS = Number.parseInt(process.env.B402_USDC_DECIMALS ?? '6', 10);
@@ -45,10 +46,13 @@ function requireConfig(): void {
   const missing = [
     ['B402_BASE_URL', B402_BASE_URL],
     ['B402_PAY_TO', B402_PAY_TO],
-    ['B402_CLIENT_ID', B402_CLIENT_ID],
-    ['B402_ACCESS_TOKEN', B402_ACCESS_TOKEN],
-    ['B402_PRIVATE_KEY_BASE64', B402_PRIVATE_KEY_BASE64],
+    ['B402_CLIENT_ID', isUsableSecret(B402_CLIENT_ID, 8) ? B402_CLIENT_ID : undefined],
+    ['B402_ACCESS_TOKEN', isUsableSecret(B402_ACCESS_TOKEN, 16) ? B402_ACCESS_TOKEN : undefined],
+    ['B402_PRIVATE_KEY_BASE64', isUsableSecret(B402_PRIVATE_KEY_BASE64, 32) ? B402_PRIVATE_KEY_BASE64 : undefined],
   ].filter(([, value]) => !value).map(([name]) => name);
+  if (B402_BASE_URL && !B402_BASE_URL.startsWith('https://')) missing.push('B402_BASE_URL_HTTPS');
+  if (B402_PAY_TO && !/^0x[0-9a-fA-F]{40}$/.test(B402_PAY_TO)) missing.push('B402_PAY_TO_ADDRESS');
+  if (!/^0x[0-9a-fA-F]{40}$/.test(USDC_ASSET)) missing.push('B402_USDC_ASSET_ADDRESS');
   if (missing.length > 0) {
     throw new Error(`Real Binance B402 seller credentials are missing: ${missing.join(', ')}. Refusing to issue a fake payment challenge.`);
   }
@@ -72,7 +76,7 @@ function unwrapB402<T>(value: unknown): T {
   if (!value || typeof value !== 'object') return value as T;
   const record = value as Record<string, unknown>;
   if (record.success === false || (typeof record.code === 'string' && record.code !== '000000')) {
-    throw new Error(`Binance B402 rejected the request: ${JSON.stringify(value)}`);
+    throw new Error('Binance B402 rejected the request');
   }
   return (record.data ?? value) as T;
 }
@@ -83,7 +87,7 @@ async function b402Post<T>(path: string, payload: Record<string, unknown>): Prom
   const config: AxiosRequestConfig = { headers: signedHeaders(body), timeout: 30_000, validateStatus: () => true };
   const response = await axios.post(`${B402_BASE_URL}${path}`, payload, config);
   if (response.status < 200 || response.status >= 300) {
-    throw new Error(`Binance B402 ${path} returned HTTP ${response.status}: ${JSON.stringify(response.data)}`);
+    throw new Error(`Binance B402 ${path} returned HTTP ${response.status}`);
   }
   return unwrapB402<T>(response.data);
 }
@@ -175,7 +179,7 @@ async function settleUntilComplete(payload: Record<string, unknown>, timeoutMs =
       };
     }
     if (!transaction) {
-      throw new Error(`Binance B402 settlement failed before broadcasting: ${JSON.stringify(response)}`);
+      throw new Error('Binance B402 settlement failed before broadcasting');
     }
     await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     delayMs = Math.min(delayMs + 1000, 5000);
@@ -189,7 +193,7 @@ export async function verifyAndSettlePayment(paymentHeader: string, requirement:
   const verification = await b402Post<Record<string, unknown>>('/papi/v2/b402/verify', payload);
   const verificationData = (verification.data ?? verification) as Record<string, unknown>;
   if (verificationData.isValid !== true) {
-    throw new Error(`Binance B402 rejected payment verification: ${JSON.stringify(verification)}`);
+    throw new Error('Binance B402 rejected payment verification');
   }
   await audit('x402.payment.verified', { network: requirement.network, amount: requirement.amount, asset: requirement.asset });
   const receipt = await settleUntilComplete(payload);
@@ -202,5 +206,10 @@ export function reportPriceUsdc(): number {
 }
 
 export function b402IsConfigured(): boolean {
-  return Boolean(B402_BASE_URL && B402_PAY_TO && B402_CLIENT_ID && B402_ACCESS_TOKEN && B402_PRIVATE_KEY_BASE64);
+  return Boolean(B402_BASE_URL?.startsWith('https://')
+    && B402_PAY_TO && /^0x[0-9a-fA-F]{40}$/.test(B402_PAY_TO)
+    && /^0x[0-9a-fA-F]{40}$/.test(USDC_ASSET)
+    && isUsableSecret(B402_CLIENT_ID, 8)
+    && isUsableSecret(B402_ACCESS_TOKEN, 16)
+    && isUsableSecret(B402_PRIVATE_KEY_BASE64, 32));
 }

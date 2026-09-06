@@ -9,8 +9,15 @@ target/
 *.env.*
 !.env.example
 .mcp-tokens.json
+.mcp-token-key
 logs/
 *.log
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
 .vscode/
 .idea/
 .DS_Store

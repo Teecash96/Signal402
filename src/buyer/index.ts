@@ -2,16 +2,23 @@ import 'dotenv/config';
 
 import axios from 'axios';
 import { audit } from '../lib/audit.js';
+import { validateSellerEndpoint } from '../lib/endpointSecurity.js';
 import { BinanceMcpClient, extractUsdtBalance, type BinanceBalance, type BinanceOrder } from '../lib/binanceMcp.js';
 import { purchaseReport, type PaidReport } from '../lib/binanceX402Client.js';
 import { assessLiveTradeRisk, type RiskAssessment } from './riskGuardian.js';
 
 const SELLER_ENDPOINT = process.env.SELLER_ENDPOINT_URL ?? 'http://localhost:3001';
+validateSellerEndpoint(SELLER_ENDPOINT);
 const SYMBOL = (process.env.TRADE_SYMBOL ?? 'BNBUSDT').toUpperCase();
 const configuredMax = Number.parseFloat(process.env.MAX_TRADE_SIZE_USDT ?? '10');
 const MAX_TRADE_SIZE_USDT = Number.isFinite(configuredMax) ? Math.min(configuredMax, 10) : 10;
 const APPROVAL_TIMEOUT_MS = Number.parseInt(process.env.APPROVAL_TIMEOUT_MS ?? '300000', 10);
 const APPROVAL_POLL_MS = Number.parseInt(process.env.APPROVAL_POLL_MS ?? '1000', 10);
+const HOST_TOKEN = process.env.SIGNAL402_HOST_TOKEN ?? '';
+
+function sellerAuthConfig(): { headers: { Authorization: string } } {
+  return { headers: { Authorization: `Bearer ${HOST_TOKEN}` } };
+}
 
 type Signal = { sentiment: string; asset: string; recommendation: string };
 
@@ -45,25 +52,15 @@ async function publishRiskRefusal(
       side: 'BUY',
       amountUSDT: risk.proposedSizeUSDT,
       balanceUSDT: risk.balanceUSDT,
-      riskStatus: 'refused',
-      status: 'refused',
       reason: risk.reason,
       ...(paymentReceiptId ? { paymentReceiptId } : {}),
-      beforeBalances: balanceSnapshot(beforeBalances),
-    });
+    }, sellerAuthConfig());
   }
   await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, {
     proposalId,
-    asset: signal.asset,
-    side: 'BUY',
-    amountUSDT: risk.proposedSizeUSDT,
-    balanceUSDT: risk.balanceUSDT,
     status: 'refused',
-    riskStatus: 'refused',
     reason: risk.reason,
-    ...(paymentReceiptId ? { paymentReceiptId } : {}),
-    beforeBalances: balanceSnapshot(beforeBalances),
-  });
+  }, sellerAuthConfig());
   await audit('buyer.risk.refused', { proposalId, asset: signal.asset, proposedSizeUSDT: risk.proposedSizeUSDT, balanceUSDT: risk.balanceUSDT });
   return proposalId;
 }
@@ -76,10 +73,9 @@ async function createTradeProposal(signal: Signal, risk: RiskAssessment, payment
     side: 'BUY',
     amountUSDT: risk.proposedSizeUSDT,
     balanceUSDT: risk.balanceUSDT,
-    riskStatus: 'approved',
     reason: risk.reason,
     paymentReceiptId,
-  });
+  }, sellerAuthConfig());
   if (!response.data?.proposalId) throw new Error('Seller did not create a trade proposal');
   await audit('buyer.trade.proposed', { proposalId, asset: signal.asset, amountUSDT: risk.proposedSizeUSDT, balanceUSDT: risk.balanceUSDT });
   return `${response.data.proposalId}`;
@@ -90,7 +86,7 @@ async function waitForDashboardApproval(proposalId: string): Promise<boolean> {
   console.log(`\n🖥️  Proposal ${proposalId} is waiting in the Seller dashboard.`);
   console.log('   Open http://localhost:3001 and click APPROVE.');
   while (Date.now() < deadline) {
-    const response = await axios.get(`${SELLER_ENDPOINT}/api/trade/proposal/${encodeURIComponent(proposalId)}`);
+    const response = await axios.get(`${SELLER_ENDPOINT}/api/trade/proposal/${encodeURIComponent(proposalId)}`, sellerAuthConfig());
     const status = `${response.data.status}`;
     if (status === 'approved') return true;
     if (status === 'refused' || status === 'cancelled') return false;
@@ -118,11 +114,8 @@ async function publishTradeFilled(
   if (price === undefined) throw new Error('MCP order response did not include a real filled price');
   await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, {
     proposalId,
-    asset: signal.asset,
-    side: 'BUY',
     amountUSDT: order.quoteAmount,
     status: 'filled',
-    riskStatus: 'approved',
     orderId: order.orderId,
     filledPrice: price,
     executedQty: order.executedQty,
@@ -131,7 +124,7 @@ async function publishTradeFilled(
     beforeBalances: balanceSnapshot(before),
     afterBalances: balanceSnapshot(after),
     reason: `Real Binance MCP Spot MARKET BUY ${order.orderId} confirmed with post-trade balance read.`,
-  });
+  }, sellerAuthConfig());
   await audit('buyer.trade.filled', { proposalId, orderId: order.orderId, filledPrice: price, beforeBalances: balanceSnapshot(before), afterBalances: balanceSnapshot(after) });
 }
 
@@ -196,7 +189,7 @@ async function runBuyerAgent(): Promise<void> {
     const proposalId = await createTradeProposal(signal, risk, report.paymentReceiptId);
     const approved = await waitForDashboardApproval(proposalId);
     if (!approved) {
-      await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, { proposalId, status: 'cancelled', reason: 'Human dashboard approval was not received.' });
+      await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, { proposalId, status: 'cancelled', reason: 'Human dashboard approval was not received.' }, sellerAuthConfig());
       console.log('🛑 No order was submitted.');
       return;
     }
