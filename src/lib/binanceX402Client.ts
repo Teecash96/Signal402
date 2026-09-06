@@ -38,6 +38,12 @@ export type PaidReport = {
   paymentResponse: unknown;
 };
 
+export type ReportPaymentChallenge = {
+  url: string;
+  paymentRequirements: string;
+  body: unknown;
+};
+
 function decodePaymentHeader(response: { headers: Record<string, unknown>; data?: unknown }): string {
   const headers = response.headers;
   const value = headers['payment-required'] ?? headers['x-payment-requirements'] ?? headers['PAYMENT-REQUIRED'] ?? headers['X-PAYMENT-REQUIREMENTS'];
@@ -66,7 +72,8 @@ async function baw<T>(args: string[]): Promise<T> {
   }
 }
 
-async function confirmPayment(option: PreviewOption): Promise<void> {
+async function confirmPayment(option: PreviewOption, explicitlyApproved: boolean): Promise<void> {
+  if (explicitlyApproved) return;
   if (process.env.CONFIRM_X402_PAYMENT === 'true') return;
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error('Real x402 signing requires a human confirmation. Set CONFIRM_X402_PAYMENT=true only when you have explicitly approved this exact payment.');
@@ -100,11 +107,11 @@ function paymentReceiptId(headers: Record<string, unknown>): { id: string; raw: 
   }
   const record = decoded && typeof decoded === 'object' ? decoded as Record<string, unknown> : {};
   const id = record.txHash ?? record.transaction ?? record.transactionHash;
-  if (typeof id !== 'string' || !id) throw new Error('PAYMENT-RESPONSE did not contain a real settlement transaction hash');
+  if (typeof id !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(id)) throw new Error('PAYMENT-RESPONSE did not contain a real 32-byte settlement transaction hash');
   return { id, raw: decoded };
 }
 
-export async function purchaseReport(endpoint: string, resourcePath = '/api/report'): Promise<PaidReport> {
+export async function requestReportChallenge(endpoint: string, resourcePath = '/api/report'): Promise<ReportPaymentChallenge> {
   const url = `${endpoint.replace(/\/$/, '')}${resourcePath}`;
   await audit('x402.resource.requested', { url });
   let challenge;
@@ -114,25 +121,47 @@ export async function purchaseReport(endpoint: string, resourcePath = '/api/repo
     throw new Error(`Seller challenge request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (challenge.status !== 402) throw new Error(`Expected real HTTP 402 from seller, received ${challenge.status}`);
-  const paymentRequirements = decodePaymentHeader(challenge);
+  return {
+    url,
+    paymentRequirements: decodePaymentHeader(challenge),
+    body: challenge.data,
+  };
+}
+
+export async function payReportChallenge(
+  challenge: ReportPaymentChallenge,
+  options: { explicitlyApproved?: boolean } = {},
+): Promise<PaidReport> {
+  const paymentRequirements = challenge.paymentRequirements;
   const preview = await baw<Preview>(['x402-payment', 'preview', '--paymentRequirements', paymentRequirements, '--json']);
-  const ready = preview.options.find((option) => option.status === 'READY_TO_SIGN');
+  const ready = preview.options.find((option) => option.status === 'READY_TO_SIGN'
+    && option.tokenSymbol?.toUpperCase() === 'USDC'
+    && Number.parseFloat(option.amount ?? '') === 0.01);
   if (!ready) {
-    throw new Error(`No signable Binance Agentic Wallet x402 option. Options: ${JSON.stringify(preview.options)}`);
+    throw new Error(`No signable 0.01 USDC Binance Agentic Wallet x402 option. Options: ${JSON.stringify(preview.options)}`);
   }
   await audit('x402.payment.previewed', { paymentId: preview.paymentId, optionIndex: ready.index, token: ready.tokenSymbol, amount: ready.amount, payTo: ready.payTo });
-  await confirmPayment(ready);
+  await confirmPayment(ready, options.explicitlyApproved === true);
   const signed = await baw<SignResult>(['x402-payment', 'sign', '--paymentId', preview.paymentId, '--selectedIndex', String(ready.index), '--json']);
   if (!signed.paymentHeaderName || !signed.paymentHeaderValue) throw new Error('baw did not return a replay payment header');
   if (signed.approveTxHash) await waitForApprovalTransaction(signed.approveTxHash);
   await audit('x402.payment.signed', { paymentId: preview.paymentId, optionIndex: ready.index, approveTxHash: signed.approveTxHash ?? null });
-  const paid = await axios.post(url, {}, {
+  const paid = await axios.post(challenge.url, {}, {
     headers: { [signed.paymentHeaderName]: signed.paymentHeaderValue },
     validateStatus: () => true,
     timeout: 90_000,
   });
   if (paid.status !== 200) throw new Error(`Seller rejected the signed x402 payment with HTTP ${paid.status}: ${JSON.stringify(paid.data)}`);
   const receipt = paymentReceiptId(paid.headers as Record<string, unknown>);
-  await audit('x402.resource.delivered', { url, paymentReceiptId: receipt.id });
+  await audit('x402.resource.delivered', { url: challenge.url, paymentReceiptId: receipt.id });
   return { body: paid.data, paymentReceiptId: receipt.id, paymentResponse: receipt.raw };
+}
+
+export async function purchaseReport(
+  endpoint: string,
+  resourcePath = '/api/report',
+  options: { explicitlyApproved?: boolean } = {},
+): Promise<PaidReport> {
+  const challenge = await requestReportChallenge(endpoint, resourcePath);
+  return payReportChallenge(challenge, options);
 }

@@ -18,6 +18,8 @@ const SYMBOL = (process.env.TRADE_SYMBOL ?? 'BNBUSDT').toUpperCase();
 const PUBLIC_BASE_URL = process.env.PUBLIC_SELLER_URL ?? `http://localhost:${PORT}`;
 const ALLOW_PUBLIC_REST_FALLBACK = process.env.ALLOW_PUBLIC_REST_FALLBACK === 'true';
 const MAX_TRADE_SIZE_USDT = Number.parseFloat(process.env.MAX_TRADE_SIZE_USDT ?? '10');
+const BINANCE_MODE = process.env.SIGNAL402_BINANCE_MODE ?? 'host';
+const HOST_TOKEN = process.env.SIGNAL402_HOST_TOKEN;
 
 type MarketSource = 'MCP' | 'FALLBACK' | 'UNAVAILABLE';
 type ProposalStatus = 'idle' | 'pending' | 'approved' | 'refused' | 'filled' | 'cancelled';
@@ -34,6 +36,9 @@ type TradeProposal = {
   paymentReceiptId?: string;
   orderId?: string;
   filledPrice?: number;
+  executedQty?: number;
+  source?: string;
+  mcpToolName?: string;
   beforeBalances?: unknown;
   afterBalances?: unknown;
   updatedAt: string;
@@ -42,6 +47,7 @@ type TradeProposal = {
 type SellerState = {
   service: string;
   symbol: string;
+  binanceMode: 'host' | 'direct';
   mcpStatus: 'connecting' | 'live' | 'error';
   mcpTools: string[];
   marketSource: MarketSource;
@@ -58,6 +64,7 @@ type SellerState = {
 const state: SellerState = {
   service: 'Signal402 Seller Agent',
   symbol: SYMBOL,
+  binanceMode: BINANCE_MODE === 'direct' ? 'direct' : 'host',
   mcpStatus: 'connecting',
   mcpTools: [],
   marketSource: 'UNAVAILABLE',
@@ -71,6 +78,12 @@ const mcp = new BinanceMcpClient();
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '32kb' }));
+
+function hostAuthorized(req: Request): boolean {
+  if (!HOST_TOKEN) return false;
+  const authorization = req.headers.authorization;
+  return authorization === `Bearer ${HOST_TOKEN}`;
+}
 
 function touch(message: string): void {
   state.updatedAt = new Date().toISOString();
@@ -95,6 +108,28 @@ async function readPublicRestTicker(): Promise<BinanceTicker> {
 }
 
 async function refreshMarketData(): Promise<void> {
+  if (BINANCE_MODE !== 'direct') {
+    if (state.marketSource === 'MCP') return;
+    if (!ALLOW_PUBLIC_REST_FALLBACK) {
+      state.mcpStatus = 'connecting';
+      state.marketSource = 'UNAVAILABLE';
+      touch('Waiting for the supported Binance MCP host to publish live market data.');
+      return;
+    }
+    try {
+      const ticker = await readPublicRestTicker();
+      state.mcpStatus = 'error';
+      state.marketSource = 'FALLBACK';
+      state.ticker = ticker;
+      touch(`FALLBACK market data live ${ticker.symbol} ${ticker.price}`);
+      await audit('seller.market.read', { source: 'FALLBACK', symbol: ticker.symbol, price: ticker.price, reason: 'Supported Binance MCP host has not published data yet' });
+    } catch (error: unknown) {
+      state.mcpStatus = 'connecting';
+      state.marketSource = 'UNAVAILABLE';
+      touch(`Waiting for MCP data. Public REST fallback failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return;
+  }
   state.mcpStatus = 'connecting';
   try {
     const ticker = await mcp.getTicker(SYMBOL);
@@ -187,20 +222,52 @@ app.get('/', (_req, res) => {
 </header>
 <section class="grid gap-5 lg:grid-cols-[1.1fr_.9fr]">
 <article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-cyan">Seller Agent</p><h2 class="mt-2 text-2xl font-semibold">Analyst Agent</h2></div><span class="rounded-lg border border-cyan/20 bg-cyan/10 px-3 py-2 text-xs text-cyan">LIVE FEED</span></div><div class="grid gap-4 sm:grid-cols-3"><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Pair</p><p id="pair" class="mt-2 text-xl font-semibold">${SYMBOL}</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Last price</p><p id="price" class="mt-2 text-xl font-semibold text-lime">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">24h change</p><p id="change" class="mt-2 text-xl font-semibold">Waiting</p></div></div><div class="mt-5 rounded-xl border border-line bg-ink p-4"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Research paywall</span><span class="text-sm font-semibold text-cyan">0.01 USDC</span></div><p class="mt-3 text-sm leading-6 text-slate-400">Real Binance B402 v2 settlement. The briefing is withheld until verification and on-chain settlement succeed.</p><p id="paymentReceipt" class="mt-3 break-all font-mono text-xs text-slate-500">Receipt: waiting</p></div></article>
-<article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Buyer Agent</p><h2 class="mt-2 text-2xl font-semibold">Trader Agent</h2></div><span class="rounded-lg border border-lime/20 bg-lime/10 px-3 py-2 text-xs text-lime">HUMAN GATE</span></div><div class="rounded-xl border border-line bg-ink p-5"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Risk Guardian</span><span id="riskBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-400">idle</span></div><p id="riskReason" class="mt-4 text-sm leading-6 text-slate-400">Waiting for a buyer proposal backed by a live balance read.</p><div class="mt-5 grid grid-cols-2 gap-3 text-sm"><div><p class="text-xs text-slate-500">Proposed size</p><p id="tradeSize" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT available</p><p id="balance" class="mt-1 font-semibold">Waiting</p></div></div><button id="approve" class="mt-6 hidden w-full rounded-xl bg-lime px-4 py-3 text-sm font-bold text-ink transition hover:bg-lime/80">APPROVE</button><p id="order" class="mt-4 break-all font-mono text-xs text-slate-500">Order: waiting</p></div></article>
+<article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Buyer Agent</p><h2 class="mt-2 text-2xl font-semibold">Trader Agent</h2></div><span class="rounded-lg border border-lime/20 bg-lime/10 px-3 py-2 text-xs text-lime">HUMAN GATE</span></div><div class="rounded-xl border border-line bg-ink p-5"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Risk Guardian</span><span id="riskBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-400">idle</span></div><p id="riskReason" class="mt-4 text-sm leading-6 text-slate-400">Waiting for a buyer proposal backed by a live balance read.</p><div class="mt-5 grid gap-3 text-sm sm:grid-cols-3"><div><p class="text-xs text-slate-500">Proposed size</p><p id="tradeSize" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT before</p><p id="balance" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT after</p><p id="balanceAfter" class="mt-1 font-semibold">Waiting</p></div></div><button id="approve" class="mt-6 hidden w-full rounded-xl bg-lime px-4 py-3 text-sm font-bold text-ink transition hover:bg-lime/80">APPROVE</button><p id="order" class="mt-4 break-all font-mono text-xs text-slate-500">Order: waiting</p></div></article>
 </section>
-<section class="mt-5 grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><article class="rounded-2xl border border-line bg-panel p-6"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Safety model</p><div class="mt-4 space-y-3 text-sm text-slate-300"><p>✓ OAuth token cache is local and gitignored.</p><p>✓ No withdrawal scope exists in Binance Agent OS.</p><p>✓ Every order requires this human APPROVE action.</p><p>✓ Spot MARKET BUY is capped at 10 USDT.</p><p>✓ Every action is appended to a local JSONL audit log.</p></div></article><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Agent activity</p><span id="updated" class="font-mono text-xs text-slate-600">waiting</span></div><div id="activity" class="mono mt-4 max-h-56 space-y-2 overflow-auto text-xs leading-5 text-slate-400"><p>Waiting for the Seller Agent.</p></div></article></section>
+<section class="mt-5 grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><article class="rounded-2xl border border-line bg-panel p-6"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Safety model</p><div class="mt-4 space-y-3 text-sm text-slate-300"><p>✓ Binance OAuth is owned by the supported MCP host.</p><p>✓ Signal402 never stores or forwards Binance tokens.</p><p>✓ No withdrawal scope exists in Binance Agent OS.</p><p>✓ Every order requires this human APPROVE action.</p><p>✓ Spot MARKET BUY is capped at 10 USDT.</p><p>✓ Every action is appended to a local JSONL audit log.</p></div></article><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Agent activity</p><span id="updated" class="font-mono text-xs text-slate-600">waiting</span></div><div id="activity" class="mono mt-4 max-h-56 space-y-2 overflow-auto text-xs leading-5 text-slate-400"><p>Waiting for the Seller Agent.</p></div></article></section>
 </main><script>
 const esc=(v)=>String(v??'').replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const set=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value};
+const usdt=(balances)=>{const b=Array.isArray(balances)?balances.find((x)=>String(x?.asset??'').toUpperCase()==='USDT'):null;return b&&Number.isFinite(Number(b.free))?Number(b.free):undefined};
 async function approve(id){const b=document.getElementById('approve');b.disabled=true;b.textContent='APPROVING';await fetch('/api/trade/approve',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({proposalId:id})});await update()}
-async function update(){try{const s=await (await fetch('/api/state',{cache:'no-store'})).json();set('mcpBadge',s.mcpStatus==='live'?'MCP: LIVE':s.mcpStatus==='error'?'MCP: ERROR':'MCP: CONNECTING');set('sourceBadge',s.marketSource==='MCP'?'DATA: MCP LIVE':s.marketSource==='FALLBACK'?'DATA: FALLBACK':'DATA: WAITING');if(s.ticker){set('pair',s.ticker.symbol);set('price',Number(s.ticker.price).toFixed(8)+' USDT');set('change',Number.isFinite(Number(s.ticker.changePercent))?Number(s.ticker.changePercent).toFixed(2)+'%':'Unavailable')}set('paymentReceipt',s.paymentReceiptId?'Receipt: '+s.paymentReceiptId:'Receipt: waiting');set('updated',new Date(s.updatedAt).toLocaleTimeString());const p=s.proposal;const badge=document.getElementById('riskBadge');const button=document.getElementById('approve');if(p){set('riskBadge',p.status==='refused'?'RISK GUARDIAN: refused':p.status==='filled'?'TRADE FILLED':p.status==='approved'?'APPROVED':p.status.toUpperCase());badge.className='rounded-full border px-3 py-1 text-xs '+(p.status==='refused'?'border-rose-500/40 bg-rose-500/10 text-rose-300':p.status==='filled'?'border-lime/40 bg-lime/10 text-lime':'border-cyan/40 bg-cyan/10 text-cyan');set('riskReason',p.reason);set('tradeSize',Number(p.amountUSDT).toFixed(2)+' USDT');set('balance',Number(p.balanceUSDT).toFixed(2)+' USDT');set('order',p.orderId?'Order: '+p.orderId+(p.filledPrice?' · filled price '+Number(p.filledPrice).toFixed(8):''):'Order: waiting');if(p.status==='pending'){button.classList.remove('hidden');button.disabled=false;button.textContent='APPROVE';button.onclick=()=>approve(p.proposalId)}else{button.classList.add('hidden')}}else{button.classList.add('hidden')}const a=document.getElementById('activity');a.innerHTML=(s.activity||[]).map((x)=>'<p>'+esc(x)+'</p>').join('')||'<p>Waiting for the Seller Agent.</p>'}catch(e){console.error(e)}}update();setInterval(update,1500);
+async function update(){try{const s=await (await fetch('/api/state',{cache:'no-store'})).json();set('mcpBadge',s.mcpStatus==='live'?'MCP: LIVE':s.marketSource==='FALLBACK'?'MCP: FALLBACK':s.mcpStatus==='error'?'MCP: ERROR':'MCP: CONNECTING');set('sourceBadge',s.marketSource==='MCP'?'DATA: MCP LIVE':s.marketSource==='FALLBACK'?'DATA: FALLBACK':'DATA: WAITING');if(s.ticker){set('pair',s.ticker.symbol);set('price',Number(s.ticker.price).toFixed(8)+' USDT');set('change',Number.isFinite(Number(s.ticker.changePercent))?Number(s.ticker.changePercent).toFixed(2)+'%':'Unavailable')}set('paymentReceipt',s.paymentReceiptId?'Receipt: '+s.paymentReceiptId:'Receipt: waiting');set('updated',new Date(s.updatedAt).toLocaleTimeString());const p=s.proposal;const badge=document.getElementById('riskBadge');const button=document.getElementById('approve');if(p){set('riskBadge',p.status==='refused'?'RISK GUARDIAN: refused':p.status==='filled'?'TRADE FILLED':p.status==='approved'?'APPROVED':p.status.toUpperCase());badge.className='rounded-full border px-3 py-1 text-xs '+(p.status==='refused'?'border-rose-500/40 bg-rose-500/10 text-rose-300':p.status==='filled'?'border-lime/40 bg-lime/10 text-lime':'border-cyan/40 bg-cyan/10 text-cyan');set('riskReason',p.reason);set('tradeSize',Number(p.amountUSDT).toFixed(2)+' USDT');const beforeUsdt=usdt(p.beforeBalances);const afterUsdt=usdt(p.afterBalances);set('balance',(beforeUsdt===undefined?Number(p.balanceUSDT).toFixed(2):beforeUsdt.toFixed(8))+' USDT');set('balanceAfter',afterUsdt===undefined?'Waiting':afterUsdt.toFixed(8)+' USDT');set('order',p.orderId?'Order: '+p.orderId+(p.filledPrice?' · filled price '+Number(p.filledPrice).toFixed(8):''):'Order: waiting');if(p.status==='pending'){button.classList.remove('hidden');button.disabled=false;button.textContent='APPROVE';button.onclick=()=>approve(p.proposalId)}else{button.classList.add('hidden')}}else{button.classList.add('hidden')}const a=document.getElementById('activity');a.innerHTML=(s.activity||[]).map((x)=>'<p>'+esc(x)+'</p>').join('')||'<p>Waiting for the Seller Agent.</p>'}catch(e){console.error(e)}}update();setInterval(update,1500);
 </script></body></html>`);
 });
 
 app.get('/api/state', (_req, res) => res.json(publicState()));
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, mcp: state.mcpStatus === 'live', marketSource: state.marketSource, x402Configured: b402IsConfigured() }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, mcp: state.mcpStatus === 'live', marketSource: state.marketSource, binanceMode: state.binanceMode, x402Configured: b402IsConfigured() }));
+
+app.post('/api/host/market', async (req, res) => {
+  if (!hostAuthorized(req)) {
+    res.status(401).json({ success: false, error: 'Supported Binance MCP host authorization is missing' });
+    return;
+  }
+  const body = req.body as {
+    source?: unknown;
+    symbol?: unknown;
+    price?: unknown;
+    changePercent?: unknown;
+    toolNames?: unknown;
+    observedAt?: unknown;
+  };
+  const symbol = `${body.symbol ?? ''}`.trim().toUpperCase();
+  const price = Number(body.price);
+  const changePercent = body.changePercent === undefined || body.changePercent === null ? undefined : Number(body.changePercent);
+  const toolNames = Array.isArray(body.toolNames) ? body.toolNames.filter((name): name is string => typeof name === 'string' && name.trim() !== '') : [];
+  if (body.source !== 'binance-mcp' || symbol !== SYMBOL || !Number.isFinite(price) || price <= 0 || (changePercent !== undefined && !Number.isFinite(changePercent)) || toolNames.length === 0) {
+    res.status(400).json({ success: false, error: 'Host market payload must contain a real Binance MCP source, matching symbol, positive price, and runtime tool names' });
+    return;
+  }
+  state.mcpStatus = 'live';
+  state.marketSource = 'MCP';
+  state.mcpTools = toolNames;
+  state.ticker = { symbol, price, changePercent, raw: { source: body.source, observedAt: body.observedAt ?? new Date().toISOString() } };
+  state.lastError = undefined;
+  touch(`Supported Binance MCP host published ${symbol} ${price}`);
+  await audit('seller.market.host_received', { source: body.source, symbol, price, changePercent, toolNames, observedAt: body.observedAt });
+  res.json({ success: true, source: 'MCP', symbol, price, changePercent, toolNames });
+});
 
 app.get('/api/report/info', (_req, res) => res.json({
   service: 'Signal402 Seller Agent',
@@ -250,6 +317,10 @@ app.post('/api/report', async (req, res) => {
 
 app.post('/api/trade/proposal', async (req, res) => {
   const body = req.body as Partial<TradeProposal>;
+  if (state.paymentStatus !== 'settled' || !state.paymentReceiptId || body.paymentReceiptId !== state.paymentReceiptId) {
+    res.status(409).json({ success: false, error: 'A proposal requires the current real B402 settlement receipt' });
+    return;
+  }
   const amount = Number(body.amountUSDT);
   const balance = Number(body.balanceUSDT);
   if (!body.proposalId || !body.asset || !Number.isFinite(amount) || amount <= 0 || amount > MAX_TRADE_SIZE_USDT || !Number.isFinite(balance)) {
@@ -312,8 +383,22 @@ app.post('/api/trade/status', async (req, res) => {
     res.status(400).json({ success: false, error: 'Invalid trade status' });
     return;
   }
-  if (nextStatus === 'filled' && (!body.orderId || `${body.orderId}`.trim() === '')) {
-    res.status(400).json({ success: false, error: 'A real Binance order ID is required for filled status' });
+  if (nextStatus === 'filled' && body.source === 'binance-mcp-host' && !hostAuthorized(req)) {
+    res.status(401).json({ success: false, error: 'Supported Binance MCP host authorization is required for fill receipts' });
+    return;
+  }
+  if (nextStatus === 'filled' && (
+    !body.orderId
+    || `${body.orderId}`.trim() === ''
+    || body.source !== 'binance-mcp-host' && body.source !== 'binance-mcp-direct-approved'
+    || !body.mcpToolName
+    || !Number.isFinite(Number(body.filledPrice))
+    || !Number.isFinite(Number(body.executedQty))
+    || !Number.isFinite(Number(body.amountUSDT))
+    || Number(body.amountUSDT) <= 0
+    || Number(body.amountUSDT) > MAX_TRADE_SIZE_USDT
+  )) {
+    res.status(400).json({ success: false, error: 'A filled status requires a real Binance MCP source, tool name, order ID, filled price, executed quantity, and capped quote amount' });
     return;
   }
   proposal.status = nextStatus as ProposalStatus;
@@ -321,6 +406,9 @@ app.post('/api/trade/status', async (req, res) => {
   proposal.reason = `${body.reason ?? proposal.reason}`;
   proposal.orderId = typeof body.orderId === 'string' ? body.orderId : proposal.orderId;
   proposal.filledPrice = Number.isFinite(Number(body.filledPrice)) ? Number(body.filledPrice) : proposal.filledPrice;
+  proposal.executedQty = Number.isFinite(Number(body.executedQty)) ? Number(body.executedQty) : proposal.executedQty;
+  proposal.source = typeof body.source === 'string' ? body.source : proposal.source;
+  proposal.mcpToolName = typeof body.mcpToolName === 'string' ? body.mcpToolName : proposal.mcpToolName;
   proposal.beforeBalances = body.beforeBalances ?? proposal.beforeBalances;
   proposal.afterBalances = body.afterBalances ?? proposal.afterBalances;
   proposal.updatedAt = new Date().toISOString();
@@ -332,7 +420,8 @@ app.post('/api/trade/status', async (req, res) => {
 const server = app.listen(PORT, () => {
   console.log(`\n📡 Signal402 Seller Agent listening on http://localhost:${PORT}`);
   console.log(`   Pair: ${SYMBOL}`);
-  console.log(`   MCP: ${process.env.BINANCE_MCP_URL ?? 'https://agent.binance.com/mcp/agentic'}`);
+  console.log(`   Binance integration: ${BINANCE_MODE === 'direct' ? 'DIRECT CLIENT (requires Binance approval)' : 'SUPPORTED HOST MCP'}`);
+  if (BINANCE_MODE !== 'direct') console.log('   Host bridge: POST live market data from the supported Binance MCP host to /api/host/market');
   console.log(`   x402: ${b402IsConfigured() ? 'B402 credentials detected' : 'NOT CONFIGURED. Real payments only.'}`);
   console.log(`   Public REST fallback: ${ALLOW_PUBLIC_REST_FALLBACK ? 'ENABLED AND LABELLED' : 'DISABLED'}`);
   void refreshMarketData();

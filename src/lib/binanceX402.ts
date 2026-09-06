@@ -11,6 +11,7 @@ const B402_PAY_TO = process.env.B402_PAY_TO;
 const B402_CLIENT_ID = process.env.B402_CLIENT_ID;
 const B402_ACCESS_TOKEN = process.env.B402_ACCESS_TOKEN;
 const B402_PRIVATE_KEY_BASE64 = process.env.B402_PRIVATE_KEY_BASE64;
+const SETTLEMENT_TIMEOUT_MS = Number.parseInt(process.env.B402_SETTLEMENT_TIMEOUT_MS ?? `${30 * 60 * 1000}`, 10);
 
 export type PaymentRequirement = {
   scheme: string;
@@ -156,7 +157,7 @@ function verifyPayload(paymentPayload: unknown, requirement: PaymentRequirement)
   };
 }
 
-async function settleUntilComplete(payload: Record<string, unknown>, timeoutMs = 5 * 60 * 1000): Promise<SettlementReceipt> {
+async function settleUntilComplete(payload: Record<string, unknown>, timeoutMs = SETTLEMENT_TIMEOUT_MS): Promise<SettlementReceipt> {
   const started = Date.now();
   let delayMs = 3000;
   while (Date.now() - started < timeoutMs) {
@@ -164,7 +165,7 @@ async function settleUntilComplete(payload: Record<string, unknown>, timeoutMs =
     const data = (response.data ?? response) as Record<string, unknown>;
     const transaction = typeof data.transaction === 'string' ? data.transaction : '';
     if (data.success === true) {
-      if (!transaction) throw new Error('Binance B402 reported successful settlement without a transaction hash');
+      if (!/^0x[0-9a-fA-F]{64}$/.test(transaction)) throw new Error('Binance B402 reported successful settlement without a valid 32-byte transaction hash');
       return {
         transaction,
         payer: typeof data.payer === 'string' ? data.payer : undefined,

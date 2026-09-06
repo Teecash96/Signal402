@@ -125,6 +125,9 @@ async function publishTradeFilled(
     riskStatus: 'approved',
     orderId: order.orderId,
     filledPrice: price,
+    executedQty: order.executedQty,
+    source: 'binance-mcp-direct-approved',
+    mcpToolName: order.mcpToolName,
     beforeBalances: balanceSnapshot(before),
     afterBalances: balanceSnapshot(after),
     reason: `Real Binance MCP Spot MARKET BUY ${order.orderId} confirmed with post-trade balance read.`,
@@ -160,6 +163,11 @@ async function executeApprovedTrade(
 }
 
 async function runBuyerAgent(): Promise<void> {
+  if ((process.env.SIGNAL402_BINANCE_MODE ?? 'host') !== 'direct') {
+    console.error('The Buyer CLI direct path is disabled in supported host mode. Configure the Signal402 MCP server in Codex, Claude, Cursor, or ChatGPT and call signal402_get_workflow.');
+    process.exitCode = 1;
+    return;
+  }
   console.log(`\nSIGNAL402 BUYER AGENT\nReal Binance payment, real MCP account reads, real Spot order after dashboard approval.\nOrder cap: ${MAX_TRADE_SIZE_USDT.toFixed(2)} USDT\n`);
   if (configuredMax > 10) console.log('MAX_TRADE_SIZE_USDT was above the hard 10 USDT safety cap. It was reduced to 10 USDT.');
   const mcp = new BinanceMcpClient();

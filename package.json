@@ -8,6 +8,7 @@
     "build": "tsc",
     "start:seller": "npx tsx src/seller/index.ts",
     "start:buyer": "npx tsx src/buyer/index.ts",
+    "start:signal402-agent": "npx tsx src/agent/server.ts",
     "dev:seller": "npx tsx watch src/seller/index.ts",
     "dev:buyer": "npx tsx watch src/buyer/index.ts",
     "test": "node --import tsx --test test/**/*.test.ts"
@@ -30,7 +31,8 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

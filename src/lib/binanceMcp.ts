@@ -48,6 +48,7 @@ export interface BinanceBalance {
 
 export interface BinanceOrder {
   orderId: string;
+  mcpToolName?: string;
   status?: string;
   symbol?: string;
   side?: string;
@@ -290,6 +291,9 @@ export class BinanceMcpClient {
   }
 
   private async connectInternal(): Promise<void> {
+    if (process.env.SIGNAL402_BINANCE_MODE !== 'direct' || process.env.BINANCE_MCP_CLIENT_APPROVED !== 'true') {
+      throw new Error('Direct Binance MCP OAuth is disabled. Use the supported Binance MCP host. Set SIGNAL402_BINANCE_MODE=direct and BINANCE_MCP_CLIENT_APPROVED=true only after Binance approves this client.');
+    }
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const client = new Client({ name: 'signal402', version: '1.0.0' }, { capabilities: {} });
@@ -524,6 +528,7 @@ export class BinanceMcpClient {
       }
       order = {
         orderId: `${idValue}`,
+        mcpToolName: tool.name,
         status: typeof status === 'string' ? status : undefined,
         symbol: typeof findProperty(record, ['symbol', 'pair']) === 'string' ? `${findProperty(record, ['symbol', 'pair'])}` : request.symbol,
         side: typeof findProperty(record, ['side']) === 'string' ? `${findProperty(record, ['side'])}` : request.side,
