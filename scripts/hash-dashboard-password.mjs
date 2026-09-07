@@ -2,7 +2,7 @@ import { randomBytes, scryptSync } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import readline from 'node:readline';
 
-function readPassword() {
+async function readPassword() {
   if (!process.stdin.isTTY) {
     return new Promise((resolve, reject) => {
       let value = '';
@@ -16,17 +16,29 @@ function readPassword() {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise((resolve) => rl.question('Dashboard password (12+ characters): ', (answer) => { rl.close(); resolve(answer); }));
   }
-  const terminalState = execFileSync('stty', ['-g'], { encoding: 'utf8' }).trim();
-  execFileSync('stty', ['-echo']);
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question('Dashboard password (12+ characters): ', (answer) => {
-      rl.close();
-      execFileSync('stty', [terminalState]);
-      process.stdout.write('\n');
-      resolve(answer);
+  // Child processes do not inherit the terminal by default. Give stty the
+  // real terminal so it can read and restore the current terminal settings.
+  const terminalState = execFileSync('stty', ['-g'], {
+    encoding: 'utf8',
+    stdio: ['inherit', 'pipe', 'inherit'],
+  }).trim();
+  try {
+    execFileSync('stty', ['-echo'], { stdio: ['inherit', 'ignore', 'inherit'] });
+    return await new Promise((resolve, reject) => {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      rl.question('Dashboard password (12+ characters): ', (answer) => {
+        rl.close();
+        process.stdout.write('\n');
+        resolve(answer);
+      });
+      rl.on('SIGINT', () => {
+        rl.close();
+        reject(new Error('Password entry cancelled'));
+      });
     });
-  });
+  } finally {
+    execFileSync('stty', [terminalState], { stdio: ['inherit', 'ignore', 'inherit'] });
+  }
 }
 
 const password = await readPassword();
