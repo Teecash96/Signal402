@@ -136,7 +136,7 @@ export async function buildPaymentRequired(resourceUrl: string): Promise<{
   };
   const body: Record<string, unknown> = {
     x402Version: 2,
-    resource: { url: resourceUrl, description: 'Signal402 live Binance market briefing', mimeType: 'application/json' },
+    resource: { url: resourceUrl, description: 'Signal402 verified Binance market intelligence with an explainable screening result', mimeType: 'application/json' },
     accepts: [requirement],
   };
   const headerValue = Buffer.from(JSON.stringify(body), 'utf8').toString('base64');

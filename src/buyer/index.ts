@@ -20,17 +20,27 @@ function sellerAuthConfig(): { headers: { Authorization: string } } {
   return { headers: { Authorization: `Bearer ${HOST_TOKEN}` } };
 }
 
-type Signal = { sentiment: string; asset: string; recommendation: string };
+type Signal = {
+  direction: string;
+  action: 'BUY_SMALL' | 'WAIT';
+  risk: string;
+  confidence: string;
+  asset: string;
+  recommendation: string;
+};
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function parseTradingSignal(briefing: string): Signal {
-  const sentiment = briefing.match(/SENTIMENT:\s*([A-Z]+)/i)?.[1]?.toUpperCase() ?? 'UNKNOWN';
+  const direction = briefing.match(/DIRECTION:\s*([A-Z]+)/i)?.[1]?.toUpperCase() ?? 'UNKNOWN';
+  const action = briefing.match(/RULE ACTION:\s*(BUY_SMALL|WAIT)/i)?.[1]?.toUpperCase() as Signal['action'] | undefined;
+  const risk = briefing.match(/RISK TIER:\s*([A-Z]+)/i)?.[1]?.toUpperCase() ?? 'UNKNOWN';
+  const confidence = briefing.match(/CONFIDENCE:\s*([A-Z]+)/i)?.[1]?.toUpperCase() ?? 'UNKNOWN';
   const asset = briefing.match(/ASSET:\s*([A-Z0-9]+)/i)?.[1]?.toUpperCase() ?? SYMBOL;
-  const recommendation = briefing.split('RECOMMENDATION:')[1]?.trim() ?? 'No recommendation';
-  return { sentiment, asset, recommendation };
+  const recommendation = briefing.match(/THESIS:\s*(.+)/i)?.[1]?.trim() ?? 'No screening thesis';
+  return { direction, action: action ?? 'WAIT', risk, confidence, asset, recommendation };
 }
 
 function balanceSnapshot(balances: BinanceBalance[]): Array<{ asset: string; free: number; locked: number }> {
@@ -174,6 +184,14 @@ async function runBuyerAgent(): Promise<void> {
     console.log(`\n${briefing}`);
     console.log(`\n💳 Real x402 settlement receipt: ${report.paymentReceiptId}`);
     const signal = parseTradingSignal(briefing);
+    if (signal.action !== 'BUY_SMALL') {
+      console.log(`\n🧭 SIGNAL402 SCREEN: WAIT`);
+      console.log(`   Direction: ${signal.direction}. Risk: ${signal.risk}. Confidence: ${signal.confidence}.`);
+      console.log(`   ${signal.recommendation}`);
+      console.log('   No balance read, proposal, or order was submitted.');
+      await audit('buyer.signal.wait', { asset: signal.asset, direction: signal.direction, risk: signal.risk, confidence: signal.confidence });
+      return;
+    }
     await mcp.connect();
     const liveRisk = await assessLiveTradeRisk(mcp, MAX_TRADE_SIZE_USDT);
     const beforeBalances = liveRisk.balances;

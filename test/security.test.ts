@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DashboardAuth, hashDashboardPassword } from '../src/lib/auth.js';
 import { decryptText, encryptText } from '../src/lib/cryptoStore.js';
+import { deriveMarketSignal } from '../src/lib/marketSignal.js';
 import { isUsableSecret } from '../src/lib/securityConfig.js';
 
 test('local sensitive data envelope authenticates and decrypts', () => {
@@ -34,4 +35,27 @@ test('dashboard authentication hashes passwords and rate limits failures', async
 test('placeholder secrets are rejected', () => {
   assert.equal(isUsableSecret('replace-with-a-random-local-token'), false);
   assert.equal(isUsableSecret('c'.repeat(32)), true);
+});
+
+test('market intelligence produces an explainable small buy screen', () => {
+  const signal = deriveMarketSignal({
+    price: 102,
+    changePercent: 2.4,
+    highPrice: 104,
+    lowPrice: 99,
+    weightedAvgPrice: 100,
+    quoteVolume: 250_000,
+  });
+  assert.equal(signal.direction, 'BULLISH');
+  assert.equal(signal.action, 'BUY_SMALL');
+  assert.equal(signal.risk, 'LOW');
+  assert.equal(signal.confidence, 'HIGH');
+  assert.match(signal.rationale, /momentum/i);
+});
+
+test('market intelligence blocks bearish or high volatility conditions', () => {
+  assert.equal(deriveMarketSignal({ price: 98, changePercent: -1.2, highPrice: 101, lowPrice: 97 }).action, 'WAIT');
+  const volatile = deriveMarketSignal({ price: 110, changePercent: 3, highPrice: 120, lowPrice: 100, quoteVolume: 10_000 });
+  assert.equal(volatile.risk, 'HIGH');
+  assert.equal(volatile.action, 'WAIT');
 });

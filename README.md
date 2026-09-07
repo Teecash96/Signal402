@@ -4,6 +4,20 @@ Signal402 is a real Binance Agent OS agent. A Seller Agent sells a live briefing
 
 There are no simulated payments, receipts, balances, fills, or order IDs.
 
+## What the buyer pays for
+
+Signal402 does not sell a raw ticker wrapper. It sells a verified market intelligence artifact for a requested symbol. After real B402 settlement, the Seller returns the live Binance snapshot plus an explainable screening result:
+
+1. Direction from the 24 hour move.
+2. Risk tier from momentum and the observed 24 hour range.
+3. Confidence based on the completeness of the live snapshot.
+4. A deterministic `BUY_SMALL` or `WAIT` action.
+5. The thesis and the rule that invalidates the result.
+
+The action is not a profit promise. `BUY_SMALL` only permits the next safety checks. `WAIT` blocks proposal creation. The Buyer still reads the live Agentic subaccount, applies Risk Guardian, and waits for dashboard approval. This is the reason for the 0.01 USDC payment: the Buyer pays for an independently produced, timestamped interpretation rather than free price access.
+
+The screening rules are visible and deterministic. A move of at least 1 percent is bullish, a move of at most negative 1 percent is bearish, and high risk starts at an absolute move of 8 percent or a 24 hour range of 12 percent. Only bullish, non high risk snapshots produce `BUY_SMALL`.
+
 ## Run with your own account
 
 The Binance MCP account and the B402 wallet are different Binance products. The Spot order uses the Binance Agentic subaccount. The x402 payment uses the Binance Agentic Wallet on BSC. Fund both with small amounts before using production funds.
@@ -63,9 +77,35 @@ The Binance MCP account and the B402 wallet are different Binance products. The 
 
 9. Fund the Agentic subaccount with USDT using the Binance web UI. The documented path is Profile, Dashboard, Subaccount, Asset Management, Transfer. Keep at least 10 USDT available for the capped Spot order.
 
-10. In the supported host, call `signal402_get_workflow` and follow the returned workflow. The host discovers Binance tool names at runtime, reads market data and balances, pays the real 0.01 USDC challenge after human confirmation, creates the proposal, waits for the dashboard `APPROVE`, submits one real MARKET BUY capped at 10 USDT, reads the real fill and balances, and records the receipt.
+10. In the supported host, call `signal402_get_workflow` and follow the returned workflow. The host discovers Binance tool names at runtime, publishes the live market snapshot, pays the real 0.01 USDC challenge after human confirmation, stops when the Seller returns `WAIT`, or creates the proposal when the Seller returns `BUY_SMALL`. It then waits for the dashboard `APPROVE`, submits one real MARKET BUY capped at 10 USDT, reads the real fill and balances, and records the receipt.
 
 The full agent contract is in [`SIGNAL402_AGENT.md`](./SIGNAL402_AGENT.md). Load it in the supported host before enabling trading.
+
+## Binance Futures mode
+
+Spot is the default. Set `FUTURES_SYMBOL` and use the Futures branch in `SIGNAL402_AGENT.md` only when you have deliberately funded the matching Binance Agentic Futures wallet.
+
+For a deliberate USD M directional run, set `SIGNAL402_MARKET_TYPE=USD_M`, keep `SIGNAL402_FUTURES_MODE=directional`, and publish a fresh context through `signal402_publish_futures_context`. For neutral analysis set `SIGNAL402_FUTURES_MODE=neutral`; the server will keep it report only. The context values, not an environment variable, are the source of truth for the risk proof.
+
+Signal402 supports two contract types:
+
+1. `USD_M` uses USDT collateral. Directional analysis can submit one real order when every gate passes.
+2. `COIN_M` uses coin collateral. It is report only in this version. No COIN M order write is accepted.
+
+There are two analysis modes:
+
+1. `directional` evaluates one long or short intent. A USD M opening order also needs a declared protective stop plan exposed by the live host.
+2. `neutral` measures long and short imbalance and returns a hedge ratio. It is report only. Signal402 never submits two hedge legs automatically.
+
+The Futures risk envelope is deterministic and versioned. It records the input hash, output hash, evidence tool names, decision, risk zone, margin required, margin utilization, funding exposure, spread, slippage, liquidation distance, and invalidation rule. It refuses stale data older than 15 seconds, cross margin, leverage above 3x, unverified exchange filters, missing funding or liquidation data, spread or slippage above 50 basis points, absolute funding above 5 basis points per interval, liquidation distance below 10 percent, insufficient available margin, and a combined notional above 10 USDT. The cap applies to the projected exposure. A reduce only order may lower an existing exposure.
+
+The host sends funding as `fundingRateBps`, in basis points for one funding interval. It also sends `nextFundingTime`. Signal402 does not convert an unknown unit or guess a missing interval. After dashboard approval, the host must re-read the account and market data and call `signal402_revalidate_futures_context`; a stale or changed context cancels the execution path.
+
+Signal402 requires isolated margin and reads the existing leverage. It never changes leverage, margin mode, or position mode automatically. Futures orders use an explicit symbol, side, position side, quantity, and `reduceOnly` value. `quoteOrderQty` is never sent. Every directional USD M order needs dashboard `APPROVE` and a separate `CONFIRM` step. The host then submits one live MARKET order through its runtime discovered Binance Futures MCP tool and records authenticated order and account events. The dashboard shows the receipt, order ID, fill, position, margin, and event timeline only when those values came from Binance.
+
+The risk envelope is a risk estimate, not a guaranteed loss limit. Liquidation, fees, funding changes, latency, and exchange execution can produce a different result. Keep the Agentic Futures wallet funded only with an amount you can lose, and use Binance's emergency stop if needed.
+
+The implementation follows the [Binance Agent OS agentic MCP documentation](https://developers.binance.com/en/docs/agent-native/mcp-server/agentic) and records the authenticated order and account events described by [Binance Futures user data streams](https://developers.binance.com/en/docs/products/derivatives-trading-coin-futures/user-data-streams).
 
 ## Supported host architecture
 

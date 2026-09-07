@@ -9,7 +9,21 @@ import { assessTradeRisk } from '../buyer/riskGuardian.js';
 import { payReportChallenge, requestReportChallenge, type ReportPaymentChallenge } from '../lib/binanceX402Client.js';
 import { audit } from '../lib/audit.js';
 import { validateSellerEndpoint } from '../lib/endpointSecurity.js';
+import {
+  evaluateFuturesRisk,
+  type FuturesContextInput,
+  type FuturesOrderIntentInput,
+  type FuturesRiskPolicy,
+} from '../lib/futuresRisk.js';
 import { isUsableSecret } from '../lib/securityConfig.js';
+import {
+  futuresContextSchema,
+  futuresIntentSchema,
+  futuresProposalInputSchema,
+  futuresRevalidateInputSchema,
+  futuresStatusInputSchema,
+  hostFuturesContextSchema,
+} from '../lib/schemas.js';
 
 dotenv.config({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../../.env') });
 
@@ -17,6 +31,23 @@ const SELLER_ENDPOINT = process.env.SELLER_ENDPOINT_URL ?? 'http://localhost:300
 validateSellerEndpoint(SELLER_ENDPOINT);
 const HOST_TOKEN = process.env.SIGNAL402_HOST_TOKEN;
 const MAX_TRADE_SIZE_USDT = Math.min(Number.parseFloat(process.env.MAX_TRADE_SIZE_USDT ?? '10') || 10, 10);
+function boundedPolicyEnv(name: string, fallback: number, minimum: number, maximum: number): number {
+  const configured = Number.parseFloat(process.env[name] ?? '');
+  return Number.isFinite(configured) ? Math.min(Math.max(configured, minimum), maximum) : fallback;
+}
+const MAX_FUTURES_NOTIONAL_USDT = boundedPolicyEnv('MAX_FUTURES_NOTIONAL_USDT', 10, 0.01, 10);
+const MAX_FUTURES_LEVERAGE = boundedPolicyEnv('MAX_FUTURES_LEVERAGE', 3, 1, 3);
+const FUTURES_POLICY: FuturesRiskPolicy = {
+  maxTotalNotionalUSDT: MAX_FUTURES_NOTIONAL_USDT,
+  maxLeverage: MAX_FUTURES_LEVERAGE,
+  maxDataAgeMs: boundedPolicyEnv('FUTURES_MAX_DATA_AGE_MS', 15_000, 1, 15_000),
+  maxSpreadBps: boundedPolicyEnv('FUTURES_MAX_SPREAD_BPS', 50, 0, 50),
+  maxSlippageBps: boundedPolicyEnv('FUTURES_MAX_SLIPPAGE_BPS', 50, 0, 50),
+  maxFundingBps: boundedPolicyEnv('FUTURES_MAX_FUNDING_BPS', 5, 0, 5),
+  minLiquidationDistancePct: boundedPolicyEnv('FUTURES_MIN_LIQUIDATION_DISTANCE_PCT', 10, 10, 100),
+  maxMarginUtilizationPct: boundedPolicyEnv('FUTURES_MAX_MARGIN_UTILIZATION_PCT', 25, 0, 25),
+  feeReserveRate: boundedPolicyEnv('FUTURES_FEE_RESERVE_RATE', 0.001, 0, 0.1),
+};
 const APPROVAL_POLL_MS = Number.parseInt(process.env.APPROVAL_POLL_MS ?? '1000', 10);
 const PAYMENT_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
@@ -36,15 +67,25 @@ Signal402 is a real Binance Agent OS workflow. The supported MCP host owns Binan
 
 1. Discover the currently available Binance MCP tools at runtime. Do not invent or hardcode tool names.
 2. Call the Binance MCP market data tool for the requested symbol. Do not use public REST for account or trading data.
-3. Call signal402_publish_market with the live MCP result and the runtime tool names.
+3. Call signal402_publish_market with the live MCP result and the runtime tool names. Signal402 derives an explainable direction, risk tier, and BUY_SMALL or WAIT action from that snapshot.
 4. Call signal402_request_briefing to inspect the real B402 payment terms. Verify that the amount is 0.01 USDC and that the merchant terms are expected.
 5. Ask the human to approve that exact payment. Only then call signal402_pay_briefing with confirmPayment=true.
 6. Call the Binance MCP account balance tool. Pass the live USDT balance to signal402_create_proposal.
-7. Wait for the human to press APPROVE in the Signal402 dashboard by calling signal402_wait_for_approval.
+7. If the Seller returns WAIT or a refused proposal, stop. Do not create an order. Otherwise wait for the human to press APPROVE in the Signal402 dashboard by calling signal402_wait_for_approval.
 8. Only after approved, call the Binance MCP Spot order tool with one MARKET BUY capped at 10 USDT. Use the live tool schema. Never submit an order before approval.
 9. Read the real order result and read balances again through Binance MCP. Call signal402_record_fill only with the real order ID, filled price, quantities, and before and after balances.
 
-No simulated receipt, balance, fill, or order ID is accepted. No withdrawal or transfer action is allowed. Every write action needs explicit human approval.
+Futures branch, opt in with an explicit USD_M or COIN_M context:
+1. Discover runtime Futures tools and reject tools that are not clearly marked Futures, USD M, COIN M, perpetual, derivative, or contract tools.
+2. Read mark price, bid and ask, depth, funding and next funding time, exchange filters, leverage brackets, account margin, positions, open orders, and liquidation data. Publish them with signal402_publish_futures_context.
+3. Run signal402_assess_futures_risk. The deterministic envelope fails closed on stale data, cross margin, leverage above 3x, a combined notional above 10 USDT, missing data, excessive spread, slippage, funding stress, or liquidation risk.
+4. Pay the real 0.01 USDC B402 challenge only after human payment approval. A settled receipt is required before the paid Futures report is released.
+5. Neutral and COIN M paths stop at a report. They never show an approval button and never submit an order.
+6. Directional USD_M can create a proposal only when executionEligible=true and a supported protective stop plan is declared. Wait for dashboard APPROVE, then ask the human to type CONFIRM for the exact order.
+7. Re-read the account and Futures context, then call signal402_revalidate_futures_context. Submit one MARKET order through the live runtime USD_M Futures MCP tool with symbol, side, explicit positionSide, quantity, reduceOnly, existing leverage at or below 3x, and isolated margin. Never send quoteOrderQty. Never change leverage or margin mode automatically.
+8. Monitor the private Futures user stream or authenticated order status. Record submitted, order update, account update, fill, margin call, or liquidation events with signal402_record_futures_event. Reconcile the real order ID, fills, position, margin, and before and after balances.
+
+No simulated receipt, balance, fill, or order ID is accepted. No withdrawal or transfer action is allowed. Every write action needs explicit human approval. A risk estimate is not a guaranteed loss limit.
 `.trim();
 
 function jsonResult(value: Record<string, unknown>) {
@@ -109,21 +150,97 @@ server.registerTool('signal402_publish_market', {
     symbol: z.string().min(1),
     price: z.number().finite().positive(),
     changePercent: z.number().finite().optional(),
+    highPrice: z.number().finite().positive().optional(),
+    lowPrice: z.number().finite().positive().optional(),
+    weightedAvgPrice: z.number().finite().positive().optional(),
+    volume: z.number().finite().nonnegative().optional(),
+    quoteVolume: z.number().finite().nonnegative().optional(),
     toolNames: z.array(z.string().min(1)).min(1),
     observedAt: z.string().datetime().optional(),
   },
-}, async ({ symbol, price, changePercent, toolNames, observedAt }) => {
+}, async ({ symbol, price, changePercent, highPrice, lowPrice, weightedAvgPrice, volume, quoteVolume, toolNames, observedAt }) => {
   const names = uniqueToolNames(toolNames);
   const result = await sellerRequest<Record<string, unknown>>('post', '/api/host/market', {
     source: 'binance-mcp',
     symbol: symbol.toUpperCase(),
     price,
     changePercent,
+    highPrice,
+    lowPrice,
+    weightedAvgPrice,
+    volume,
+    quoteVolume,
     toolNames: names,
     observedAt: observedAt ?? new Date().toISOString(),
   });
-  await audit('host.market.published', { symbol: symbol.toUpperCase(), price, changePercent, toolNames: names });
+  await audit('host.market.published', { symbol: symbol.toUpperCase(), price, changePercent, highPrice, lowPrice, weightedAvgPrice, quoteVolume, toolNames: names });
   return jsonResult(result);
+});
+
+server.registerTool('signal402_publish_futures_context', {
+  title: 'Publish live Binance Futures context',
+  description: 'Publish runtime discovered Futures market, funding, account, position, liquidation, and filter data. Public REST data cannot satisfy this tool.',
+  inputSchema: { ...hostFuturesContextSchema.omit({ source: true }).shape },
+}, async (input) => {
+  const parsed = hostFuturesContextSchema.omit({ source: true }).safeParse(input);
+  if (!parsed.success) throw new Error(`Invalid live Futures context: ${parsed.error.message}`);
+  const result = await sellerRequest<Record<string, unknown>>('post', '/api/host/futures/context', {
+    source: 'binance-mcp',
+    ...parsed.data,
+  });
+  await audit('host.futures.context.published', {
+    marketType: parsed.data.marketType,
+    strategyMode: parsed.data.strategyMode,
+    symbol: parsed.data.symbol,
+    toolNames: parsed.data.sourceToolNames,
+    observedAt: parsed.data.observedAt,
+  });
+  return jsonResult(result);
+});
+
+server.registerTool('signal402_revalidate_futures_context', {
+  title: 'Revalidate the approved Futures order',
+  description: 'Publish a fresh account and market context after dashboard approval. The Seller keeps the order blocked if any risk input changed or became stale.',
+  inputSchema: { ...futuresRevalidateInputSchema.shape },
+}, async (input) => {
+  const parsed = futuresRevalidateInputSchema.safeParse(input);
+  if (!parsed.success) throw new Error(`Invalid Futures revalidation payload: ${parsed.error.message}`);
+  const result = await sellerRequest<Record<string, unknown>>('post', '/api/futures/revalidate', parsed.data);
+  await audit('host.futures.context.revalidated', {
+    proposalId: parsed.data.proposalId,
+    marketType: parsed.data.marketType,
+    strategyMode: parsed.data.strategyMode,
+    symbol: parsed.data.symbol,
+    toolNames: parsed.data.sourceToolNames,
+    observedAt: parsed.data.observedAt,
+  });
+  return jsonResult(result);
+});
+
+server.registerTool('signal402_assess_futures_risk', {
+  title: 'Run the deterministic Futures risk gate',
+  description: 'Evaluate a strict live Futures context with the DeltaZero adapted risk envelope. The result never places an order.',
+  inputSchema: {
+    context: futuresContextSchema,
+    intent: futuresIntentSchema,
+  },
+}, async ({ context, intent }) => {
+  const contextParsed = futuresContextSchema.safeParse(context);
+  const intentParsed = futuresIntentSchema.safeParse(intent);
+  if (!contextParsed.success) throw new Error(`Invalid Futures risk input: ${contextParsed.error.message}`);
+  if (!intentParsed.success) throw new Error(`Invalid Futures risk input: ${intentParsed.error.message}`);
+  const envelope = evaluateFuturesRisk(contextParsed.data as FuturesContextInput, intentParsed.data as FuturesOrderIntentInput, FUTURES_POLICY);
+  await audit('host.futures.risk.created', {
+    analysisId: envelope.analysisId,
+    marketType: envelope.marketType,
+    strategyMode: envelope.strategyMode,
+    action: envelope.action,
+    riskZone: envelope.riskZone,
+    executionEligible: envelope.executionEligible,
+    inputHash: envelope.inputHash,
+    outputHash: envelope.outputHash,
+  });
+  return jsonResult(envelope as unknown as Record<string, unknown>);
 });
 
 server.registerTool('signal402_request_briefing', {
@@ -207,6 +324,30 @@ server.registerTool('signal402_create_proposal', {
   return jsonResult({ ...result, assessment, proposalId: id });
 });
 
+server.registerTool('signal402_create_futures_proposal', {
+  title: 'Create a human gated Futures proposal',
+  description: 'Create a USD M directional proposal only from a deterministic risk envelope and a real B402 receipt. Neutral and COIN M proposals remain report only.',
+  inputSchema: { ...futuresProposalInputSchema.shape },
+}, async (input) => {
+  const parsed = futuresProposalInputSchema.safeParse(input);
+  if (!parsed.success) throw new Error(`Invalid Futures proposal payload: ${parsed.error.message}`);
+  const body = parsed.data;
+  if (body.riskEnvelope.analysisId !== body.analysisId) throw new Error('Futures proposal analysis ID does not match the risk envelope');
+  if (!body.riskEnvelope.executionEligible || body.riskEnvelope.reportOnly || body.marketType !== 'USD_M' || body.strategyMode !== 'directional') {
+    throw new Error('Futures proposal is report only unless the USD M directional risk gate allows execution');
+  }
+  const result = await sellerRequest<Record<string, unknown>>('post', '/api/futures/proposal', body);
+  await audit('host.futures.proposal.created', {
+    proposalId: body.proposalId,
+    analysisId: body.analysisId,
+    marketType: body.marketType,
+    strategyMode: body.strategyMode,
+    symbol: body.symbol,
+    notionalUSDT: body.notionalUSDT,
+  });
+  return jsonResult(result);
+});
+
 server.registerTool('signal402_wait_for_approval', {
   title: 'Wait for dashboard approval',
   description: 'Wait until the human presses APPROVE in the Signal402 dashboard. No Binance order is sent by this tool.',
@@ -223,6 +364,56 @@ server.registerTool('signal402_wait_for_approval', {
     await new Promise<void>((resolve) => setTimeout(resolve, APPROVAL_POLL_MS));
   }
   return jsonResult({ proposalId, approved: false, status: 'timeout', message: 'No Binance order was submitted.' });
+});
+
+server.registerTool('signal402_wait_for_futures_approval', {
+  title: 'Wait for Futures dashboard approval',
+  description: 'Wait until the human approves the exact directional USD M proposal. This tool never submits an order.',
+  inputSchema: {
+    proposalId: z.string().min(1),
+    timeoutSeconds: z.number().int().positive().max(300).default(300),
+  },
+}, async ({ proposalId, timeoutSeconds }) => {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  while (Date.now() < deadline) {
+    const proposal = await sellerRequest<Record<string, unknown>>('get', `/api/futures/proposal/${encodeURIComponent(proposalId)}`);
+    const status = `${proposal.status ?? ''}`;
+    if (status !== 'pending') return jsonResult({ proposal, approved: status === 'approved' });
+    await new Promise<void>((resolve) => setTimeout(resolve, APPROVAL_POLL_MS));
+  }
+  return jsonResult({ proposalId, approved: false, status: 'timeout', message: 'No Binance Futures order was submitted.' });
+});
+
+server.registerTool('signal402_confirm_futures_execution', {
+  title: 'Confirm the exact Futures order',
+  description: 'Require the human to type CONFIRM after dashboard APPROVE. Returns the exact live MCP order fields for the host to submit. This tool itself does not submit an order.',
+  inputSchema: {
+    proposalId: z.string().min(1),
+    confirmExecution: z.literal('CONFIRM'),
+  },
+}, async ({ proposalId, confirmExecution }) => {
+  const proposal = await sellerRequest<Record<string, unknown>>('get', `/api/futures/proposal/${encodeURIComponent(proposalId)}`);
+  if (proposal.status !== 'approved') throw new Error(`Futures proposal ${proposalId} is not dashboard approved`);
+  const confirmation = await sellerRequest<Record<string, unknown>>('post', '/api/futures/confirm', { proposalId, confirmExecution });
+  await audit('host.futures.execution.confirmed', { proposalId });
+  return jsonResult({
+    readyToSubmit: true,
+    confirmation,
+    warning: 'Submit exactly one live USD M MARKET order through the runtime discovered Binance MCP Futures tool, then record its real events. Do not change leverage or margin mode.',
+    order: {
+      symbol: proposal.symbol,
+      side: proposal.side,
+      positionSide: proposal.positionSide,
+      quantity: proposal.quantity,
+      notionalUSDT: proposal.notionalUSDT,
+      reduceOnly: proposal.reduceOnly,
+      leverage: proposal.leverage,
+      marginMode: proposal.marginMode,
+      protectiveStopPrice: proposal.protectiveStopPrice,
+      protectiveStopSupported: proposal.protectiveStopSupported,
+      marketType: proposal.marketType,
+    },
+  });
 });
 
 server.registerTool('signal402_record_fill', {
@@ -267,6 +458,25 @@ server.registerTool('signal402_record_fill', {
   });
   await audit('host.trade.filled', { proposalId, orderId, filledPrice, executedQty, quoteAmount, mcpToolName, beforeBalances: before, afterBalances: after });
   return jsonResult({ ...result, orderId, filledPrice, beforeBalances: before, afterBalances: after });
+});
+
+server.registerTool('signal402_record_futures_event', {
+  title: 'Record a real Binance Futures event',
+  description: 'Record an authenticated Futures user stream or order status event. Simulated IDs, fills, balances, and positions are rejected by the Seller.',
+  inputSchema: { ...futuresStatusInputSchema.shape },
+}, async (input) => {
+  const parsed = futuresStatusInputSchema.safeParse(input);
+  if (!parsed.success) throw new Error(`Invalid Futures event payload: ${parsed.error.message}`);
+  const body = parsed.data;
+  const result = await sellerRequest<Record<string, unknown>>('post', '/api/futures/status', body);
+  await audit('host.futures.event.recorded', {
+    proposalId: body.proposalId,
+    eventType: body.eventType,
+    status: body.status,
+    orderId: body.orderId,
+    mcpToolName: body.mcpToolName,
+  });
+  return jsonResult(result);
 });
 
 server.registerTool('signal402_get_state', {

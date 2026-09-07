@@ -1,7 +1,7 @@
 {
   "name": "signal402",
   "version": "1.0.0",
-  "description": "An agent-to-agent market-intelligence marketplace on Binance Agent OS: AI agents buy/sell research briefings settled via Binance x402, with human-confirmed Spot trading through the Binance MCP Server.",
+  "description": "An agent-to-agent verified market-intelligence service on Binance Agent OS: AI agents pay for explainable Binance Spot and Futures briefings settled via Binance x402, with human-confirmed, risk-gated trading through runtime discovered Binance MCP tools.",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
