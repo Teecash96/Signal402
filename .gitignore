@@ -13,6 +13,7 @@ coverage/
 .mcp-tokens.json
 .mcp-token-key
 logs/
+state/
 *.log
 *.pem
 *.key

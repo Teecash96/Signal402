@@ -8,6 +8,8 @@ Use the official Binance MCP server configured by the supported host. The host o
 
 Use the Signal402 MCP server for marketplace state, x402 payment, risk checks, dashboard approval, and audit records.
 
+Before any market workflow, call `signal402_get_capabilities` and `signal402_get_risk_state`. These endpoints describe the current payment mode, source policy, hard limits, and persistent kill switch. Do not continue when the risk state is halted.
+
 ## Required sequence
 
 1. Discover Binance MCP tools at runtime. Never invent or hardcode Binance tool names.
@@ -23,6 +25,11 @@ Use the Signal402 MCP server for marketplace state, x402 payment, risk checks, d
 11. Place exactly one Spot MARKET BUY using the runtime Binance MCP order schema. The quote amount must be at most 10 USDT.
 12. Read the real order result and balances through Binance MCP.
 13. Record the fill with `signal402_record_fill` only when the order ID, filled price, quantities, and before and after balances came from Binance MCP.
+14. Verify the returned execution receipt and its SHA 256 hash. Keep the plan ID and plan hash with the evidence.
+
+## Binance CEX carry report
+
+When both Spot and Futures market reads are available, publish them with `signal402_publish_carry_context` and read `signal402_get_carry_report`. The report compares basis, signed funding carry, fees, spread, slippage, and net expected carry on Binance CEX. It is report only. It never opens a hedge, submits two legs, or changes the Spot or Futures workflow.
 
 ## Futures branch
 
@@ -51,3 +58,9 @@ Never use public REST for account or order data. Public REST is an explicitly la
 If a Binance MCP response is missing, ambiguous, stale, or rate limited, stop. Do not retry a write blindly.
 
 The 10 USDT cap is a combined notional policy, not a promise that losses cannot exceed 10 USDT. Futures PnL, funding, fees, and liquidation remain exchange risks.
+
+## Execution plan and receipt rules
+
+An eligible proposal returns a single use plan with a 60 second expiry. The plan hash covers all order fields and the current context and risk proof. Dashboard approval changes plan state but does not change the intent. Futures revalidation creates a fresh plan and requires dashboard approval again. Never submit an order when the plan is expired, tampered, or different from the order request.
+
+Signal402 creates an execution receipt only after it receives real Binance order and account evidence. The receipt contains ordered event records and a hash. It does not contain OAuth tokens, API keys, wallet credentials, or raw MCP payloads. A receipt is not valid proof unless its hash verifies and the account or position snapshots show the expected change.

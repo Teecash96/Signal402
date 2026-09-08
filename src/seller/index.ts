@@ -12,14 +12,34 @@ import { dashboardCspNonce, configureHttpSecurity } from '../lib/httpSecurity.js
 import { deriveMarketSignal, type MarketSignal } from '../lib/marketSignal.js';
 import { createRateLimiter } from '../lib/rateLimit.js';
 import { assessTradeRisk } from '../buyer/riskGuardian.js';
+import { evaluateCexCarry, type CexCarryContext, type CexCarryReport } from '../lib/carryEconomics.js';
+import {
+  buildExecutionReceipt,
+  type ExecutionReceipt,
+} from '../lib/executionReceipt.js';
+import {
+  createExecutionPlan,
+  expireExecutionPlan,
+  isExecutionPlanCurrent,
+  transitionExecutionPlan,
+  type ExecutionPlan,
+} from '../lib/executionPlan.js';
+import { RiskStateStore, type RiskState } from '../lib/riskState.js';
 import {
   emptyBodySchema,
+  carryContextSchema,
+  carryReportSchema,
+  equityUpdateSchema,
+  executionReceiptSchema,
   futuresProposalInputSchema,
   futuresRevalidateInputSchema,
   futuresStatusInputSchema,
   hostFuturesContextSchema,
   hostMarketSchema,
+  killSwitchInputSchema,
   parseBody,
+  resetHaltInputSchema,
+  riskStateSchema,
   tradeProposalInputSchema,
   tradeStatusInputSchema,
 } from '../lib/schemas.js';
@@ -27,6 +47,7 @@ import { isUsableSecret } from '../lib/securityConfig.js';
 import { hasCurrentReportAccess, reportAccessMode, type ReportAccessStatus } from '../lib/reportAccess.js';
 import {
   evaluateFuturesRisk,
+  sha256,
   type FuturesContextInput,
   type FuturesOrderIntentInput,
   type FuturesRiskEnvelope,
@@ -72,6 +93,7 @@ const FUTURES_POLICY: FuturesRiskPolicy = {
   feeReserveRate: boundedPolicyEnv('FUTURES_FEE_RESERVE_RATE', 0.001, 0, 0.1),
 };
 const DASHBOARD_AUTH = new DashboardAuth();
+const RISK_STATE = new RiskStateStore();
 
 type MarketSource = 'MCP' | 'FALLBACK' | 'UNAVAILABLE';
 type ProposalStatus = 'idle' | 'pending' | 'approved' | 'refused' | 'filled' | 'cancelled';
@@ -87,6 +109,9 @@ type TradeProposal = {
   signalRisk?: string;
   status: ProposalStatus;
   riskStatus: 'approved' | 'refused' | 'pending';
+  plan?: ExecutionPlan;
+  receipt?: ExecutionReceipt;
+  approvalAt?: string;
   paymentReceiptId?: string;
   orderId?: string;
   filledPrice?: number;
@@ -117,6 +142,9 @@ type FuturesProposal = {
   reason: string;
   status: FuturesTradeState;
   riskStatus: 'approved' | 'refused' | 'pending';
+  plan?: ExecutionPlan;
+  receipt?: ExecutionReceipt;
+  approvalAt?: string;
   paymentReceiptId?: string;
   riskEnvelope: FuturesRiskEnvelope;
   orderId?: string;
@@ -170,6 +198,8 @@ type SellerState = {
   futuresRisk?: FuturesRiskEnvelope;
   futuresProposal?: FuturesProposal;
   futuresEvents: FuturesEvent[];
+  carryReport?: CexCarryReport;
+  riskState: RiskState;
   activity: string[];
   updatedAt: string;
 };
@@ -184,6 +214,7 @@ const state: SellerState = {
   reportsSold: 0,
   paymentStatus: 'waiting',
   futuresEvents: [],
+  riskState: RISK_STATE.load(),
   activity: [],
   updatedAt: new Date().toISOString(),
 };
@@ -220,6 +251,13 @@ function futuresToolNameAllowed(name: string): boolean {
     && !/(withdraw|transfer|deposit)/.test(text);
 }
 
+function cexToolNameAllowed(name: string): boolean {
+  const text = name.toLowerCase();
+  return !/(withdraw|transfer|deposit|wallet|private.?key|account|balance|position|trade)/.test(text)
+    && !/(new.?order|create.?order|place.?order|cancel.?order|submit.?order)/.test(text)
+    && /(spot|futures|ticker|mark|funding|order.?book|depth|price|fee|exchange|market)/.test(text);
+}
+
 function snapshotNotional(snapshot: unknown, symbol: string, markPrice: number): number {
   if (!Array.isArray(snapshot)) return 0;
   return snapshot.reduce((total, item) => {
@@ -247,6 +285,11 @@ function touch(message: string): void {
   state.activity = [`${new Date().toLocaleTimeString()} ${message}`.slice(0, 320), ...state.activity].slice(0, 30);
 }
 
+function currentRiskState(): RiskState {
+  state.riskState = RISK_STATE.snapshot();
+  return state.riskState;
+}
+
 function publicState(): Record<string, unknown> {
   const proposal = state.proposal;
   const futuresContext = state.futuresContext;
@@ -272,6 +315,8 @@ function publicState(): Record<string, unknown> {
     paymentReceiptId: state.paymentReceiptId,
     paymentStatus: state.paymentStatus,
     accessMode: ACCESS_MODE,
+    riskState: currentRiskState(),
+    carryReport: state.carryReport,
     proposal: proposal ? {
       proposalId: proposal.proposalId,
       asset: proposal.asset,
@@ -283,6 +328,9 @@ function publicState(): Record<string, unknown> {
       signalRisk: proposal.signalRisk,
       status: proposal.status,
       riskStatus: proposal.riskStatus,
+      plan: proposal.plan,
+      receipt: proposal.receipt,
+      approvalAt: proposal.approvalAt,
       paymentReceiptId: proposal.paymentReceiptId,
       orderId: proposal.orderId,
       filledPrice: proposal.filledPrice,
@@ -370,6 +418,9 @@ function publicState(): Record<string, unknown> {
         reason: futuresProposal.reason,
         status: futuresProposal.status,
         riskStatus: futuresProposal.riskStatus,
+        plan: futuresProposal.plan,
+        receipt: futuresProposal.receipt,
+        approvalAt: futuresProposal.approvalAt,
         paymentReceiptId: futuresProposal.paymentReceiptId,
         orderId: futuresProposal.orderId,
         filledPrice: futuresProposal.filledPrice,
@@ -528,6 +579,14 @@ function briefing(): string {
     `INVALIDATION: ${signal.invalidation}`,
     `DATA SOURCE: ${sourceLabel}`,
     `OBSERVED AT: ${new Date().toISOString()}`,
+    ...(state.carryReport ? [
+      '',
+      'BINANCE CEX CARRY (REPORT ONLY):',
+      `CARRY DECISION: ${state.carryReport.decision}`,
+      `BASIS: ${state.carryReport.basisBps.toFixed(2)} bps · FUNDING CARRY: ${state.carryReport.fundingCarryBps.toFixed(2)} bps`,
+      `ROUND TRIP COST: ${state.carryReport.roundTripCostBps.toFixed(2)} bps · NET EXPECTED CARRY: ${state.carryReport.netExpectedCarryBps.toFixed(2)} bps`,
+      `CARRY INPUT HASH: ${state.carryReport.inputHash}`,
+    ] : []),
     '',
     'SAFETY:',
     'This is an explainable screening result, not a profit guarantee. A BUY_SMALL result still requires a live balance check and human approval. A WAIT result blocks order creation.',
@@ -649,6 +708,7 @@ main article button{min-height:44px;letter-spacing:.04em}
 <article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Buyer Agent</p><h2 class="mt-2 text-2xl font-semibold">Trader Agent</h2></div><span class="rounded-lg border border-lime/20 bg-lime/10 px-3 py-2 text-xs text-lime">HUMAN GATE</span></div><div class="rounded-xl border border-line bg-ink p-5"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Risk Guardian</span><span id="riskBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-400">idle</span></div><p id="riskReason" class="mt-4 text-sm leading-6 text-slate-400">Waiting for a buyer proposal backed by a live balance read.</p><div class="mt-5 grid gap-3 text-sm sm:grid-cols-3"><div><p class="text-xs text-slate-500">Proposed size</p><p id="tradeSize" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT before</p><p id="balance" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT after</p><p id="balanceAfter" class="mt-1 font-semibold">Waiting</p></div></div><button id="approve" class="mt-6 hidden w-full rounded-xl bg-lime px-4 py-3 text-sm font-bold text-ink transition hover:bg-lime/80">APPROVE</button><p id="order" class="mt-4 break-all font-mono text-xs text-slate-500">Order: waiting</p></div></article>
 </section>
 <section class="mt-5 grid gap-5 lg:grid-cols-[1.1fr_.9fr]"><article class="glow rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-cyan">Futures risk gate</p><h2 class="mt-2 text-2xl font-semibold">USDⓈ M and COIN M analysis</h2></div><span id="futuresMcpBadge" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">MCP: WAITING</span></div><div class="mt-5 grid gap-3 sm:grid-cols-3"><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Contract</p><p id="futuresContract" class="mt-1 font-semibold">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Strategy</p><p id="futuresStrategy" class="mt-1 font-semibold">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Decision</p><p id="futuresDecision" class="mt-1 font-semibold">Waiting</p></div></div><div class="mt-4 grid gap-3 text-sm sm:grid-cols-3"><div><p class="text-xs text-slate-500">Risk zone</p><p id="futuresRiskZone" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Eligibility</p><p id="futuresEligibility" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Leverage / margin</p><p id="futuresLeverage" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Available margin</p><p id="futuresAvailable" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Maintenance margin</p><p id="futuresMaintenance" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Funding</p><p id="futuresFunding" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Spread / slippage</p><p id="futuresSpread" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Liquidation distance</p><p id="futuresLiquidation" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Hedge ratio</p><p id="futuresHedge" class="mt-1 font-semibold">Not applicable</p></div></div><p id="futuresReasons" class="mt-5 rounded-xl border border-line bg-ink p-4 text-sm leading-6 text-slate-400">Waiting for strict live Futures context.</p><p id="futuresPaymentReceipt" class="mt-4 break-all font-mono text-xs text-slate-500">${FREE_ACCESS ? 'Access: FREE · no payment requested' : 'Payment receipt: waiting'}</p></article><article class="glow rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Futures execution</p><h2 class="mt-2 text-2xl font-semibold">Approval and event trail</h2></div><span id="futuresApprovalState" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">REPORT ONLY</span></div><p id="futuresOrder" class="mt-5 break-all font-mono text-xs text-slate-500">Order: waiting</p><p id="futuresBalances" class="mt-3 text-sm text-slate-400">Futures balances before and after: waiting</p><button id="approveFutures" class="mt-6 hidden w-full rounded-xl bg-lime px-4 py-3 text-sm font-bold text-ink transition hover:bg-lime/80">APPROVE FUTURES ORDER</button><p id="futuresConfirm" class="mt-4 text-sm leading-6 text-slate-400">Directional USD M execution also requires the host to ask for CONFIRM after this approval.</p><div class="mt-6"><p class="text-xs uppercase tracking-[.18em] text-slate-500">Futures event timeline</p><div id="futuresEvents" class="mono mt-3 max-h-64 space-y-2 overflow-auto text-xs leading-5 text-slate-400"><p>Waiting for authenticated Futures events.</p></div></div></article></section>
+<section class="mt-5 grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-rose-300">Risk controls</p><h2 class="mt-2 text-2xl font-semibold">Persistent guard</h2></div><span id="riskStateBadge" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">NORMAL</span></div><p id="riskStateReason" class="mt-4 text-sm leading-6 text-slate-400">New exposure is allowed only while the persistent risk state is normal.</p><button id="killSwitch" class="mt-5 w-full rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm font-bold text-rose-300 transition hover:bg-rose-500/20">ENABLE KILL SWITCH</button><div class="mt-5 space-y-3 text-sm text-slate-300"><p>✓ Kill switch and drawdown state survive a process restart.</p><p>✓ A halted state blocks new Spot and Futures proposals.</p><p>✓ Existing orders are never cancelled by this control.</p></div></article><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Binance CEX carry</p><span id="carryDecision" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">WAITING</span></div><p class="mt-3 text-sm leading-6 text-slate-400">A transparent Spot and Futures basis report. It is report only and never submits a hedge.</p><div class="mt-5 grid gap-3 text-sm sm:grid-cols-3"><div><p class="text-xs text-slate-500">Basis</p><p id="carryBasis" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Funding carry</p><p id="carryFunding" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Net expected</p><p id="carryNet" class="mt-1 font-semibold">Waiting</p></div></div><p id="carryEvidence" class="mt-5 break-all font-mono text-xs text-slate-500">Waiting for authenticated Binance market context.</p></article></section>
 <section class="mt-5 grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><article class="rounded-2xl border border-line bg-panel p-6"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Safety model</p><div class="mt-4 space-y-3 text-sm text-slate-300"><p>✓ Supported host mode keeps Binance OAuth outside Signal402.</p><p>✓ Direct OAuth is disabled unless Binance approves this client.</p><p>✓ No withdrawal scope exists in Binance Agent OS.</p><p>✓ Every Spot or Futures order requires human approval.</p><p>✓ Combined Futures notional is capped at 10 USDT and leverage at 3x.</p><p>✓ Futures use isolated margin only. Signal402 never changes leverage or margin mode.</p><p>✓ Neutral and COIN M Futures paths are report only.</p><p>✓ Every action is appended to a local JSONL audit log.</p></div></article><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Agent activity</p><span id="updated" class="font-mono text-xs text-slate-600">waiting</span></div><div id="activity" class="mono mt-4 max-h-56 space-y-2 overflow-auto text-xs leading-5 text-slate-400"><p>Waiting for the Seller Agent.</p></div></article></section>
 </main><script nonce="${nonce}">
 const set=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value};
@@ -661,6 +721,12 @@ async function approve(id){const button=document.getElementById('approve');butto
 async function approveFutures(id){const button=document.getElementById('approveFutures');button.disabled=true;button.textContent='APPROVING';const response=await fetch('/api/futures/approve',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({proposalId:id})});if(response.status===401){showLogin(true);return}await update()}
 async function update(){try{const response=await fetch('/api/state',{cache:'no-store',credentials:'same-origin'});if(response.status===401){showLogin(true);return}if(!response.ok)throw new Error('Dashboard state unavailable');const s=await response.json();showLogin(false);set('mcpBadge',s.mcpStatus==='live'?'MCP: LIVE':s.marketSource==='FALLBACK'?'MCP: FALLBACK':s.mcpStatus==='error'?'MCP: ERROR':'MCP: CONNECTING');set('sourceBadge',s.marketSource==='MCP'?'DATA: MCP LIVE':s.marketSource==='FALLBACK'?'DATA: FALLBACK':'DATA: WAITING');set('paymentModeBadge',s.accessMode==='free'?'ACCESS: FREE':'PAYMENT: B402');if(s.ticker){set('pair',s.ticker.symbol);set('price',Number(s.ticker.price).toFixed(8)+' USDT');set('change',Number.isFinite(Number(s.ticker.changePercent))?Number(s.ticker.changePercent).toFixed(2)+'%':'Unavailable')}const signal=s.marketSignal;if(signal){const action=document.getElementById('signalAction');set('signalAction',signal.action);action.className='rounded-full border px-3 py-1 text-xs '+(signal.action==='BUY_SMALL'?'border-lime/40 bg-lime/10 text-lime':'border-rose-500/40 bg-rose-500/10 text-rose-300');set('signalDirection',signal.direction);set('signalRisk',signal.risk);set('signalConfidence',signal.confidence);set('signalRationale',signal.rationale)}set('paymentReceipt',s.accessMode==='free'?'Access: FREE · no payment requested':s.paymentReceiptId?'Receipt: '+s.paymentReceiptId:'Receipt: waiting');set('updated',new Date(s.updatedAt).toLocaleTimeString());const p=s.proposal;const badge=document.getElementById('riskBadge');const button=document.getElementById('approve');if(p){set('riskBadge',p.status==='refused'?'RISK GUARDIAN: refused':p.status==='filled'?'TRADE FILLED':p.status==='approved'?'APPROVED':p.status.toUpperCase());badge.className='rounded-full border px-3 py-1 text-xs '+(p.status==='refused'?'border-rose-500/40 bg-rose-500/10 text-rose-300':p.status==='filled'?'border-lime/40 bg-lime/10 text-lime':'border-cyan/40 bg-cyan/10 text-cyan');set('riskReason',p.reason);set('tradeSize',Number(p.amountUSDT).toFixed(2)+' USDT');const beforeUsdt=usdt(p.beforeBalances);const afterUsdt=usdt(p.afterBalances);set('balance',(beforeUsdt===undefined?Number(p.balanceUSDT).toFixed(2):beforeUsdt.toFixed(8))+' USDT');set('balanceAfter',afterUsdt===undefined?'Waiting':afterUsdt.toFixed(8)+' USDT');set('order',p.orderId?'Order: '+p.orderId+(p.filledPrice?' · filled price '+Number(p.filledPrice).toFixed(8):''):'Order: waiting');if(p.status==='pending'){button.classList.remove('hidden');button.disabled=false;button.textContent='APPROVE';button.onclick=()=>approve(p.proposalId)}else{button.classList.add('hidden')}}else{button.classList.add('hidden')};const f=s.futures||{};const fc=f.context;const fr=f.risk;const fp=f.proposal;set('futuresMcpBadge',fc?'MCP: LIVE':'MCP: WAITING');if(fc){set('futuresContract',String(fc.marketType||'Unknown'));set('futuresStrategy',String(fc.strategyMode||'Unknown'));set('futuresLeverage',Number(fc.leverage).toFixed(2)+'x / '+String(fc.marginMode||'Unknown'));set('futuresAvailable',Number(fc.availableBalanceUSDT).toFixed(4)+' USDT');set('futuresMaintenance',Number(fc.maintenanceMarginUSDT).toFixed(4)+' USDT');set('futuresFunding',fr&&fr.fundingRateBps!==null?Number(fr.fundingRateBps).toFixed(2)+' bps':'Unavailable');set('futuresSpread',fr&&fr.spreadBps!==null?Number(fr.spreadBps).toFixed(2)+' / '+Number(fr.slippageBps).toFixed(2)+' bps':'Unavailable');set('futuresLiquidation',fr&&fr.liquidationDistancePct!==null?Number(fr.liquidationDistancePct).toFixed(2)+'%':'Unavailable');set('futuresHedge',fr&&fr.hedgeRatio!==null?Number(fr.hedgeRatio).toFixed(4):'Not applicable')}else{['futuresContract','futuresStrategy','futuresDecision','futuresRiskZone','futuresEligibility','futuresLeverage','futuresAvailable','futuresMaintenance','futuresFunding','futuresSpread','futuresLiquidation'].forEach((id)=>set(id,'Waiting'));set('futuresHedge','Not applicable')}if(fr){set('futuresDecision',fr.action);set('futuresRiskZone',fr.riskZone);set('futuresEligibility',fr.executionEligible?'ELIGIBLE':'REPORT ONLY / BLOCKED');set('futuresReasons',fr.reasons&&fr.reasons.length?fr.reasons.join(' '):'All strict live Futures checks passed.');set('futuresPaymentReceipt',s.accessMode==='free'?'Access: FREE · no payment requested':s.paymentReceiptId?'Payment receipt: '+s.paymentReceiptId:'Payment receipt: waiting')}else{set('futuresReasons','Waiting for strict live Futures context.');set('futuresPaymentReceipt',s.accessMode==='free'?'Access: FREE · no payment requested':s.paymentReceiptId?'Payment receipt: '+s.paymentReceiptId:'Payment receipt: waiting')}const futuresButton=document.getElementById('approveFutures');if(fp){const reportOnly=fp.marketType!=='USD_M'||fp.strategyMode!=='directional'||(fr&&!fr.executionEligible);set('futuresApprovalState',fp.status==='filled'?'FILLED':fp.status==='approved'?'APPROVED · CONFIRM REQUIRED':fp.status==='pending'?'WAITING APPROVAL':fp.status.toUpperCase());set('futuresOrder',fp.orderId?'Order: '+fp.orderId+(fp.filledPrice?' · fill '+Number(fp.filledPrice).toFixed(8)+' · qty '+Number(fp.executedQty||0).toFixed(8):''):'Order: waiting');set('futuresConfirm',reportOnly?'REPORT ONLY. No approval button and no order write is permitted.':'Dashboard approval is recorded. The host must still require CONFIRM before one live USD M order.');if(fp.status==='pending'&&!reportOnly){futuresButton.classList.remove('hidden');futuresButton.disabled=false;futuresButton.textContent='APPROVE FUTURES ORDER';futuresButton.onclick=()=>approveFutures(fp.proposalId)}else{futuresButton.classList.add('hidden')}}else{futuresButton.classList.add('hidden');set('futuresApprovalState',fr&&fr.reportOnly?'REPORT ONLY':'WAITING');set('futuresOrder','Order: waiting')}const beforeAccount=fp&&fp.beforeAccountSnapshot;const afterAccount=fp&&fp.afterAccountSnapshot;if(beforeAccount&&afterAccount){set('futuresBalances','Wallet before '+Number(beforeAccount.walletBalanceUSDT).toFixed(8)+' USDT · after '+Number(afterAccount.walletBalanceUSDT).toFixed(8)+' USDT · available after '+Number(afterAccount.availableBalanceUSDT).toFixed(8)+' USDT')}else{set('futuresBalances','Futures balances before and after: waiting')};const eventTarget=document.getElementById('futuresEvents');eventTarget.replaceChildren(...(Array.isArray(f.events)?f.events:[]).map((event)=>{const p=document.createElement('p');p.textContent=String(event.observedAt||'')+' · '+String(event.eventType||'')+' · '+String(event.status||'')+(event.orderId?' · '+String(event.orderId):'');return p}));if(!eventTarget.childElementCount){const p=document.createElement('p');p.textContent='Waiting for authenticated Futures events.';eventTarget.appendChild(p)}renderActivity(s.activity)}catch(e){console.error(e)}}
 document.getElementById('loginForm').addEventListener('submit',login);document.getElementById('logout').addEventListener('click',logout);showLogin(true);update();setInterval(update,1500);
+</script><script nonce="${nonce}">
+const controlSet=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value};
+async function refreshControls(){try{const response=await fetch('/api/state',{cache:'no-store',credentials:'same-origin'});if(!response.ok)return;const s=await response.json();const risk=s.riskState||{};const riskLabel=risk.killSwitch?'KILL SWITCH':risk.drawdownState||'NORMAL';controlSet('riskStateBadge',riskLabel);controlSet('riskStateReason',risk.killSwitchReason||((risk.drawdownState==='HALTED')?'Drawdown halt blocks new exposure.':risk.drawdownState==='WARN'?'Drawdown warning. New exposure remains subject to the normal gate.':'New exposure is allowed only while the persistent risk state is normal.'));const kill=document.getElementById('killSwitch');if(kill){kill.textContent=risk.killSwitch?'CLEAR KILL SWITCH':'ENABLE KILL SWITCH';kill.onclick=async()=>{await fetch('/api/risk/kill-switch',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({enabled:!risk.killSwitch,reason:!risk.killSwitch?'Operator action from Signal402 dashboard':undefined})});await refreshControls()}}const carry=s.carryReport;if(carry){controlSet('carryDecision',carry.decision+(carry.dataFresh?'':' · STALE'));controlSet('carryBasis',Number(carry.basisBps).toFixed(2)+' bps');controlSet('carryFunding',Number(carry.fundingCarryBps).toFixed(2)+' bps');controlSet('carryNet',Number(carry.netExpectedCarryBps).toFixed(2)+' bps');controlSet('carryEvidence','Input '+String(carry.inputHash)+' · output '+String(carry.outputHash))}}catch(_error){}}
+refreshControls();setInterval(refreshControls,1500);
+</script><script nonce="${nonce}">
+(function(){const anchor=document.getElementById('killSwitch');if(!anchor?.parentElement)return;const reset=document.createElement('button');reset.id='resetHalt';reset.type='button';reset.className='mt-3 hidden w-full rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm font-bold text-amber-300 transition hover:bg-amber-500/20';reset.textContent='RESET DRAWDOWN HALT';anchor.parentElement.insertBefore(reset,anchor.nextSibling);const sync=async()=>{try{const response=await fetch('/api/state',{cache:'no-store',credentials:'same-origin'});if(!response.ok)return;const risk=(await response.json()).riskState||{};reset.classList.toggle('hidden',risk.drawdownState!=='HALTED');reset.onclick=async()=>{const confirmation=window.prompt('Type RESET_HALT only after the account has recovered:');if(confirmation!=='RESET_HALT')return;reset.disabled=true;await fetch('/api/risk/reset-halt',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({confirm:'RESET_HALT',reason:'Operator recovery after persistent drawdown halt'})});reset.disabled=false;await sync()}}catch(_error){}};sync();setInterval(sync,1500)})();
 </script></body></html>`);
 });
 
@@ -712,7 +778,90 @@ app.get('/api/state', (req, res) => {
   res.json(publicState());
 });
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, mcp: state.mcpStatus === 'live', marketSource: state.marketSource, binanceMode: state.binanceMode }));
+app.get('/api/capabilities', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    service: state.service,
+    version: process.env.npm_package_version ?? '1.0.0',
+    binanceMode: state.binanceMode,
+    marketSource: state.marketSource,
+    payment: { mode: ACCESS_MODE, protocol: FREE_ACCESS ? 'none' : 'Binance B402 x402 v2', priceUSDC: FREE_ACCESS ? 0 : reportPriceUsdc() },
+    supported: {
+      spot: { marketData: true, marketBuy: true, maxNotionalUSDT: MAX_TRADE_SIZE_USDT },
+      futures: { usdM: { directional: true, neutral: 'report-only' }, coinM: 'report-only', maxNotionalUSDT: MAX_FUTURES_NOTIONAL_USDT, maxLeverage: MAX_FUTURES_LEVERAGE, marginMode: 'ISOLATED' },
+      carry: { venue: 'Binance CEX Spot and Futures', reportOnly: true },
+    },
+    safety: { humanApproval: true, confirmation: 'CONFIRM for USD M Futures', noWithdrawals: true, noTransfers: true, noApiKeys: true, publicRestFallback: ALLOW_PUBLIC_REST_FALLBACK },
+    secretsConfigured: { hostToken: isUsableSecret(HOST_TOKEN), dashboardPassword: DASHBOARD_AUTH.status().configured, b402Merchant: b402IsConfigured() },
+  });
+});
+
+app.get('/api/risk/state', (req, res) => {
+  if (!dashboardOrHostAuthorized(req)) {
+    res.status(401).json({ success: false, error: 'Dashboard login or host authorization required' });
+    return;
+  }
+  const snapshot = currentRiskState();
+  if (!riskStateSchema.safeParse(snapshot).success) {
+    res.status(500).json({ success: false, error: 'Risk state failed schema validation' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(snapshot);
+});
+
+app.post('/api/risk/kill-switch', async (req, res) => {
+  if (!DASHBOARD_AUTH.requireConfigured(res) || !DASHBOARD_AUTH.require(req, res)) return;
+  const parsed = parseBody(killSwitchInputSchema, req.body);
+  if (!parsed.data) {
+    res.status(400).json({ success: false, error: 'Invalid risk control payload' });
+    return;
+  }
+  const snapshot = parsed.data.enabled
+    ? RISK_STATE.setKillSwitch(parsed.data.reason ?? 'Operator kill switch enabled')
+    : RISK_STATE.clearKillSwitch();
+  state.riskState = snapshot;
+  touch(parsed.data.enabled ? 'Operator kill switch enabled. New risk is blocked.' : 'Operator kill switch cleared. Existing orders remain unchanged.');
+  await audit(parsed.data.enabled ? 'risk.kill_switch.enabled' : 'risk.kill_switch.cleared', { reason: parsed.data.reason });
+  res.json({ success: true, riskState: snapshot });
+});
+
+app.post('/api/risk/reset-halt', async (req, res) => {
+  if (!DASHBOARD_AUTH.requireConfigured(res) || !DASHBOARD_AUTH.require(req, res)) return;
+  const parsed = parseBody(resetHaltInputSchema, req.body);
+  if (!parsed.data) {
+    res.status(400).json({ success: false, error: 'Type RESET_HALT to request a drawdown halt reset' });
+    return;
+  }
+  try {
+    const snapshot = RISK_STATE.resetHalt();
+    state.riskState = snapshot;
+    touch('Operator reset the drawdown halt after the recovery check. Existing orders remain unchanged.');
+    await audit('risk.drawdown.reset', { reason: parsed.data.reason });
+    res.json({ success: true, riskState: snapshot });
+  } catch (error: unknown) {
+    res.status(409).json({ success: false, error: error instanceof Error ? error.message : 'Risk halt cannot be reset' });
+  }
+});
+
+app.post('/api/risk/equity', async (req, res) => {
+  if (!hostAuthorized(req)) {
+    res.status(401).json({ success: false, error: 'Supported Binance MCP host authorization is required' });
+    return;
+  }
+  const parsed = parseBody(equityUpdateSchema, req.body);
+  if (!parsed.data) {
+    res.status(400).json({ success: false, error: 'Invalid equity payload' });
+    return;
+  }
+  const snapshot = RISK_STATE.updateEquity(parsed.data.equityUSDT);
+  state.riskState = snapshot;
+  touch(`Equity updated from live account data. Drawdown state: ${snapshot.drawdownState}.`);
+  await audit('risk.equity.updated', { equityUSDT: parsed.data.equityUSDT, drawdownState: snapshot.drawdownState });
+  res.json({ success: true, riskState: snapshot });
+});
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, mcp: state.mcpStatus === 'live', marketSource: state.marketSource, binanceMode: state.binanceMode, riskState: currentRiskState() }));
 
 app.post('/api/host/market', async (req, res) => {
   if (!hostAuthorized(req)) {
@@ -841,6 +990,54 @@ app.get('/api/futures/risk', (req, res) => {
   res.json(state.futuresRisk);
 });
 
+app.post('/api/host/carry/context', async (req, res) => {
+  if (!hostAuthorized(req)) {
+    res.status(401).json({ success: false, error: 'Supported Binance MCP host authorization is required' });
+    return;
+  }
+  const parsed = parseBody(carryContextSchema, req.body);
+  if (!parsed.data) {
+    res.status(400).json({ success: false, error: 'Invalid Binance CEX carry context payload' });
+    return;
+  }
+  if (!parsed.data.sourceToolNames.every(cexToolNameAllowed)) {
+    res.status(400).json({ success: false, error: 'Carry context must use clearly identified Binance Spot or Futures market tools' });
+    return;
+  }
+  const report = evaluateCexCarry(parsed.data as CexCarryContext);
+  if (!carryReportSchema.safeParse(report).success) {
+    res.status(500).json({ success: false, error: 'Carry report failed schema validation' });
+    return;
+  }
+  state.carryReport = report;
+  touch(`Binance CEX carry report published for ${report.symbol}: ${report.decision}. Report only.`);
+  await audit('seller.carry.report.created', {
+    symbol: report.symbol,
+    decision: report.decision,
+    dataFresh: report.dataFresh,
+    basisBps: report.basisBps,
+    fundingCarryBps: report.fundingCarryBps,
+    netExpectedCarryBps: report.netExpectedCarryBps,
+    inputHash: report.inputHash,
+    outputHash: report.outputHash,
+    sourceToolNames: report.sourceToolNames,
+  });
+  res.json({ success: true, report });
+});
+
+app.get('/api/carry/report', (req, res) => {
+  if (!dashboardOrHostAuthorized(req)) {
+    res.status(401).json({ success: false, error: 'Dashboard login or host authorization required' });
+    return;
+  }
+  if (!state.carryReport) {
+    res.status(404).json({ success: false, error: 'No Binance CEX carry report is available' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(state.carryReport);
+});
+
 app.post('/api/futures/revalidate', async (req, res) => {
   if (!hostAuthorized(req)) {
     res.status(401).json({ success: false, error: 'Supported Binance MCP host authorization is required' });
@@ -898,6 +1095,7 @@ app.post('/api/futures/revalidate', async (req, res) => {
   if (!risk.executionEligible || risk.reportOnly) {
     proposal.status = 'cancelled';
     proposal.riskStatus = 'refused';
+    if (proposal.plan) proposal.plan = expireExecutionPlan(proposal.plan);
     proposal.updatedAt = new Date().toISOString();
     touch(`Futures proposal ${proposal.proposalId} cancelled after revalidation failed closed.`);
     await audit('seller.futures.risk.refused', {
@@ -915,8 +1113,30 @@ app.post('/api/futures/revalidate', async (req, res) => {
   state.futuresRisk = risk;
   proposal.analysisId = risk.analysisId;
   proposal.riskEnvelope = risk;
+  if (proposal.plan) {
+    proposal.plan = createExecutionPlan({
+      planId: proposal.plan.planId,
+      proposalId: proposal.proposalId,
+      kind: 'futures',
+      symbol: proposal.symbol,
+      side: proposal.side,
+      positionSide: proposal.positionSide,
+      quantity: proposal.quantity,
+      notionalUSDT: proposal.notionalUSDT,
+      reduceOnly: proposal.reduceOnly,
+      leverage: proposal.leverage,
+      marginMode: proposal.marginMode,
+      contextHash: risk.inputHash,
+      riskHash: risk.outputHash,
+      paymentReceiptId: proposal.paymentReceiptId,
+    });
+  }
+  proposal.status = 'pending';
+  proposal.riskStatus = 'approved';
+  proposal.approvalAt = undefined;
+  proposal.executionConfirmedAt = undefined;
   proposal.updatedAt = new Date().toISOString();
-  touch(`Futures proposal ${proposal.proposalId} passed fresh account and market revalidation.`);
+  touch(`Futures proposal ${proposal.proposalId} passed fresh account and market revalidation. Dashboard approval is required again.`);
   await audit('seller.futures.context.revalidated', {
     proposalId: proposal.proposalId,
     analysisId: risk.analysisId,
@@ -924,7 +1144,7 @@ app.post('/api/futures/revalidate', async (req, res) => {
     outputHash: risk.outputHash,
     observedAt: context.observedAt,
   });
-  res.json({ success: true, proposalId: proposal.proposalId, analysisId: risk.analysisId, risk });
+  res.json({ success: true, proposalId: proposal.proposalId, analysisId: risk.analysisId, risk, plan: proposal.plan, approvalRequired: true });
 });
 
 app.get('/api/report/info', (_req, res) => {
@@ -1011,9 +1231,23 @@ app.post('/api/trade/proposal', async (req, res) => {
     res.status(409).json({ success: false, error: reportAccessError('Spot') });
     return;
   }
+  if (RISK_STATE.isNewRiskBlocked()) {
+    const riskSnapshot = currentRiskState();
+    await audit('seller.trade.refused', { proposalId: body.proposalId, reason: 'Persistent risk control is blocking new exposure', drawdownState: riskSnapshot.drawdownState, killSwitch: riskSnapshot.killSwitch });
+    res.status(423).json({ success: false, error: 'New Spot risk is blocked by the persistent risk control state', riskState: riskSnapshot });
+    return;
+  }
   const asset = body.asset.toUpperCase();
   const amount = body.amountUSDT;
   const balance = body.balanceUSDT;
+  if (state.proposal?.proposalId === body.proposalId) {
+    if (state.proposal.asset !== asset || state.proposal.amountUSDT !== amount) {
+      res.status(409).json({ success: false, error: 'A proposal with this ID already exists with different order fields' });
+      return;
+    }
+    res.json({ success: true, idempotent: true, proposalId: state.proposal.proposalId, status: state.proposal.status, plan: state.proposal.plan, receipt: state.proposal.receipt });
+    return;
+  }
   if (asset !== SYMBOL || amount > MAX_TRADE_SIZE_USDT) {
     res.status(400).json({ success: false, error: `Invalid proposal. Maximum allowed size is ${MAX_TRADE_SIZE_USDT} USDT.` });
     return;
@@ -1046,12 +1280,26 @@ app.post('/api/trade/proposal', async (req, res) => {
     proposal.status = 'refused';
     proposal.riskStatus = 'refused';
   }
+  if (proposal.status === 'pending') {
+    proposal.plan = createExecutionPlan({
+      planId: `plan_${proposal.proposalId}`,
+      proposalId: proposal.proposalId,
+      kind: 'spot',
+      symbol: proposal.asset,
+      side: proposal.side,
+      quantity: undefined,
+      notionalUSDT: proposal.amountUSDT,
+      reduceOnly: false,
+      riskHash: sha256({ ticker: state.ticker, signal }),
+      paymentReceiptId: proposal.paymentReceiptId,
+    });
+  }
   state.proposal = proposal;
   touch(proposal.status === 'pending'
     ? `Trade proposal ${proposal.proposalId} is waiting for human APPROVE.`
     : `Trade proposal ${proposal.proposalId} was refused by the live screening rules.`);
   await audit('seller.trade.proposed', { proposalId: proposal.proposalId, asset: proposal.asset, amountUSDT: amount, balanceUSDT: balance, signalAction: signal.action, signalRisk: signal.risk });
-  res.json({ success: true, proposalId: proposal.proposalId, status: proposal.status });
+  res.json({ success: true, proposalId: proposal.proposalId, status: proposal.status, plan: proposal.plan, riskState: currentRiskState() });
 });
 
 app.get('/api/trade/proposal/:proposalId', (req, res) => {
@@ -1083,11 +1331,23 @@ app.post('/api/trade/approve', async (req, res) => {
     res.status(409).json({ success: false, error: `Proposal is already ${proposal.status}` });
     return;
   }
+  if (!proposal.plan || !isExecutionPlanCurrent(proposal.plan) || proposal.plan.status !== 'proposed') {
+    proposal.status = 'cancelled';
+    proposal.riskStatus = 'refused';
+    proposal.reason = 'Execution plan expired or failed integrity validation. Request a fresh proposal.';
+    proposal.updatedAt = new Date().toISOString();
+    touch(`Spot proposal ${proposal.proposalId} cancelled because its execution plan is stale.`);
+    await audit('seller.trade.refused', { proposalId: proposal.proposalId, reason: 'execution_plan_stale' });
+    res.status(409).json({ success: false, error: proposal.reason });
+    return;
+  }
   proposal.status = 'approved';
+  proposal.approvalAt = new Date().toISOString();
+  proposal.plan = transitionExecutionPlan(proposal.plan, 'approved', proposal.approvalAt);
   proposal.updatedAt = new Date().toISOString();
   touch(`Human APPROVE received for ${proposal.proposalId}. Buyer may submit one capped Spot order.`);
-  await audit('seller.trade.approved', { proposalId: proposal.proposalId, amountUSDT: proposal.amountUSDT });
-  res.json({ success: true, status: proposal.status });
+  await audit('seller.trade.approved', { proposalId: proposal.proposalId, amountUSDT: proposal.amountUSDT, planId: proposal.plan.planId, planHash: proposal.plan.planHash });
+  res.json({ success: true, status: proposal.status, plan: proposal.plan });
 });
 
 app.post('/api/trade/status', async (req, res) => {
@@ -1107,8 +1367,26 @@ app.post('/api/trade/status', async (req, res) => {
     return;
   }
   const nextStatus = body.status;
+  if (nextStatus === 'filled' && proposal.status === 'filled' && proposal.orderId === body.orderId && proposal.receipt) {
+    if ((body.planId && body.planId !== proposal.plan?.planId)
+      || (body.planHash && body.planHash !== proposal.plan?.planHash)
+      || (body.asset && body.asset.toUpperCase() !== proposal.asset)) {
+      res.status(409).json({ success: false, error: 'Idempotent fill identity does not match the original Binance execution receipt' });
+      return;
+    }
+    res.json({ success: true, idempotent: true, status: proposal.status, orderId: proposal.orderId, receipt: proposal.receipt });
+    return;
+  }
   if (nextStatus === 'filled' && proposal.status !== 'approved') {
     res.status(409).json({ success: false, error: 'Only an approved proposal can receive a fill receipt' });
+    return;
+  }
+  if (nextStatus === 'filled' && (!proposal.plan || !isExecutionPlanCurrent(proposal.plan) || proposal.plan.status !== 'approved')) {
+    res.status(409).json({ success: false, error: 'The execution plan is stale or has already been consumed. No fill can be reconciled.' });
+    return;
+  }
+  if (nextStatus === 'filled' && ((!body.planId && proposal.plan) || (body.planId && body.planId !== proposal.plan?.planId) || (body.planHash && body.planHash !== proposal.plan?.planHash))) {
+    res.status(409).json({ success: false, error: 'Fill plan identity does not match the approved immutable plan' });
     return;
   }
   if (nextStatus === 'filled' && (
@@ -1118,10 +1396,12 @@ app.post('/api/trade/status', async (req, res) => {
     || body.filledPrice === undefined
     || body.executedQty === undefined
     || body.amountUSDT === undefined
+    || !body.asset
+    || body.asset.toUpperCase() !== proposal.asset
     || !body.beforeBalances
     || !body.afterBalances
     || !state.mcpTools.includes(body.mcpToolName)
-    || body.amountUSDT > proposal.amountUSDT + 0.01
+    || body.amountUSDT !== proposal.amountUSDT
   )) {
     res.status(400).json({ success: false, error: 'A filled status requires a real Binance MCP source, tool name, order ID, filled price, executed quantity, and capped quote amount' });
     return;
@@ -1137,6 +1417,17 @@ app.post('/api/trade/status', async (req, res) => {
       return;
     }
   }
+  if (proposal.plan) {
+    const planStatus = nextStatus === 'filled' ? 'filled' : nextStatus === 'refused' ? 'refused' : 'cancelled';
+    try {
+      proposal.plan = nextStatus === 'filled'
+        ? transitionExecutionPlan(transitionExecutionPlan(proposal.plan, 'submitted'), 'filled')
+        : isExecutionPlanCurrent(proposal.plan) ? transitionExecutionPlan(proposal.plan, planStatus) : expireExecutionPlan(proposal.plan);
+    } catch (error: unknown) {
+      res.status(409).json({ success: false, error: error instanceof Error ? error.message : 'Execution plan transition failed' });
+      return;
+    }
+  }
   proposal.status = nextStatus as ProposalStatus;
   proposal.riskStatus = nextStatus === 'refused' ? 'refused' : 'approved';
   proposal.reason = `${body.reason ?? proposal.reason}`.slice(0, 500);
@@ -1147,10 +1438,37 @@ app.post('/api/trade/status', async (req, res) => {
   proposal.mcpToolName = body.mcpToolName ?? proposal.mcpToolName;
   proposal.beforeBalances = body.beforeBalances ?? proposal.beforeBalances;
   proposal.afterBalances = body.afterBalances ?? proposal.afterBalances;
+  if (nextStatus === 'filled' && proposal.plan && proposal.orderId && proposal.mcpToolName) {
+    proposal.receipt = buildExecutionReceipt({
+      kind: 'spot',
+      proposalId: proposal.proposalId,
+      planId: proposal.plan.planId,
+      paymentReceiptId: proposal.paymentReceiptId,
+      riskHash: proposal.plan.riskHash,
+      approvalAt: proposal.approvalAt,
+      submittedAt: proposal.updatedAt,
+      settledAt: new Date().toISOString(),
+      mcpToolName: proposal.mcpToolName,
+      orderId: proposal.orderId,
+      filledPrice: proposal.filledPrice,
+      executedQty: proposal.executedQty,
+      quoteAmount: body.amountUSDT,
+      beforeBalances: proposal.beforeBalances,
+      afterBalances: proposal.afterBalances,
+      events: [
+        { sequence: 1, type: 'ORDER_SUBMITTED', observedAt: proposal.updatedAt, detail: { source: proposal.source } },
+        { sequence: 2, type: 'FILL_RECONCILED', observedAt: new Date().toISOString(), detail: { orderId: proposal.orderId } },
+      ],
+    });
+    if (!executionReceiptSchema.safeParse(proposal.receipt).success) {
+      res.status(500).json({ success: false, error: 'Execution receipt failed schema validation' });
+      return;
+    }
+  }
   proposal.updatedAt = new Date().toISOString();
   touch(nextStatus === 'filled' ? `REAL TRADE FILLED. Order ${proposal.orderId}` : `Trade ${nextStatus}: ${proposal.reason}`);
-  await audit(`seller.trade.${nextStatus}`, { proposalId: proposal.proposalId, orderId: proposal.orderId, filledPrice: proposal.filledPrice, beforeBalances: proposal.beforeBalances, afterBalances: proposal.afterBalances });
-  res.json({ success: true, status: proposal.status, orderId: proposal.orderId });
+  await audit(`seller.trade.${nextStatus}`, { proposalId: proposal.proposalId, planId: proposal.plan?.planId, planHash: proposal.plan?.planHash, receiptId: proposal.receipt?.receiptId, orderId: proposal.orderId, filledPrice: proposal.filledPrice, beforeBalances: proposal.beforeBalances, afterBalances: proposal.afterBalances });
+  res.json({ success: true, status: proposal.status, orderId: proposal.orderId, receipt: proposal.receipt, plan: proposal.plan });
 });
 
 app.post('/api/futures/proposal', async (req, res) => {
@@ -1173,6 +1491,12 @@ app.post('/api/futures/proposal', async (req, res) => {
   }
   if (!reportAccessIsCurrent(body.paymentReceiptId)) {
     res.status(409).json({ success: false, error: reportAccessError('Futures') });
+    return;
+  }
+  if (RISK_STATE.isNewRiskBlocked() && !body.reduceOnly) {
+    const riskSnapshot = currentRiskState();
+    await audit('seller.futures.risk.refused', { proposalId: body.proposalId, reason: 'Persistent risk control is blocking new exposure', drawdownState: riskSnapshot.drawdownState, killSwitch: riskSnapshot.killSwitch });
+    res.status(423).json({ success: false, error: 'New Futures risk is blocked by the persistent risk control state', riskState: riskSnapshot });
     return;
   }
   if (body.analysisId !== risk.analysisId || body.riskEnvelope.analysisId !== risk.analysisId || body.riskEnvelope.inputHash !== risk.inputHash || body.riskEnvelope.outputHash !== risk.outputHash) {
@@ -1229,6 +1553,22 @@ app.post('/api/futures/proposal', async (req, res) => {
     riskEnvelope: risk,
     updatedAt: new Date().toISOString(),
   };
+  proposal.plan = createExecutionPlan({
+    planId: `plan_${proposal.proposalId}`,
+    proposalId: proposal.proposalId,
+    kind: 'futures',
+    symbol: proposal.symbol,
+    side: proposal.side,
+    positionSide: proposal.positionSide,
+    quantity: proposal.quantity,
+    notionalUSDT: proposal.notionalUSDT,
+    reduceOnly: proposal.reduceOnly,
+    leverage: proposal.leverage,
+    marginMode: proposal.marginMode,
+    contextHash: risk.inputHash,
+    riskHash: risk.outputHash,
+    paymentReceiptId: proposal.paymentReceiptId,
+  });
   state.futuresProposal = proposal;
   state.futuresEvents = [];
   touch(`USD M directional Futures proposal ${proposal.proposalId} is waiting for dashboard APPROVE.`);
@@ -1244,7 +1584,7 @@ app.post('/api/futures/proposal', async (req, res) => {
     inputHash: risk.inputHash,
     outputHash: risk.outputHash,
   });
-  res.json({ success: true, proposalId: proposal.proposalId, status: proposal.status, executionEligible: risk.executionEligible });
+  res.json({ success: true, proposalId: proposal.proposalId, status: proposal.status, executionEligible: risk.executionEligible, plan: proposal.plan });
 });
 
 app.get('/api/futures/proposal/:proposalId', (req, res) => {
@@ -1281,11 +1621,22 @@ app.post('/api/futures/approve', async (req, res) => {
     res.status(409).json({ success: false, error: 'This Futures proposal is report only' });
     return;
   }
+  if (!proposal.plan || !isExecutionPlanCurrent(proposal.plan) || proposal.plan.status !== 'proposed') {
+    proposal.status = 'cancelled';
+    proposal.riskStatus = 'refused';
+    proposal.reason = 'Execution plan expired or failed integrity validation. Request a fresh Futures context.';
+    proposal.updatedAt = new Date().toISOString();
+    await audit('seller.futures.risk.refused', { proposalId: proposal.proposalId, reason: 'execution_plan_stale', stage: 'approval' });
+    res.status(409).json({ success: false, error: proposal.reason });
+    return;
+  }
   proposal.status = 'approved';
+  proposal.approvalAt = new Date().toISOString();
+  proposal.plan = transitionExecutionPlan(proposal.plan, 'approved', proposal.approvalAt);
   proposal.updatedAt = new Date().toISOString();
   touch(`Human APPROVE received for Futures proposal ${proposal.proposalId}. CONFIRM is required before the live MCP order.`);
-  await audit('seller.futures.approval.received', { proposalId: proposal.proposalId, notionalUSDT: proposal.notionalUSDT, orderId: proposal.orderId });
-  res.json({ success: true, status: proposal.status });
+  await audit('seller.futures.approval.received', { proposalId: proposal.proposalId, planId: proposal.plan.planId, planHash: proposal.plan.planHash, notionalUSDT: proposal.notionalUSDT, orderId: proposal.orderId });
+  res.json({ success: true, status: proposal.status, plan: proposal.plan });
 });
 
 app.post('/api/futures/confirm', async (req, res) => {
@@ -1307,6 +1658,10 @@ app.post('/api/futures/confirm', async (req, res) => {
     res.status(409).json({ success: false, error: 'Dashboard APPROVE is required before CONFIRM' });
     return;
   }
+  if (!proposal.plan || !isExecutionPlanCurrent(proposal.plan) || proposal.plan.status !== 'approved') {
+    res.status(409).json({ success: false, error: 'The approved Futures execution plan is stale or already consumed' });
+    return;
+  }
   if (!state.futuresContext || !state.futuresIntent) {
     res.status(409).json({ success: false, error: 'A fresh Futures context is required before CONFIRM' });
     return;
@@ -1324,10 +1679,11 @@ app.post('/api/futures/confirm', async (req, res) => {
     return;
   }
   proposal.executionConfirmedAt = new Date().toISOString();
+  proposal.plan = transitionExecutionPlan(proposal.plan, 'confirmed', proposal.executionConfirmedAt);
   proposal.updatedAt = proposal.executionConfirmedAt;
   touch(`Human CONFIRM received for Futures proposal ${proposal.proposalId}. One live USD M order may be submitted.`);
-  await audit('seller.futures.execution.confirmed', { proposalId: proposal.proposalId });
-  res.json({ success: true, confirmed: true, confirmedAt: proposal.executionConfirmedAt });
+  await audit('seller.futures.execution.confirmed', { proposalId: proposal.proposalId, planId: proposal.plan.planId, planHash: proposal.plan.planHash });
+  res.json({ success: true, confirmed: true, confirmedAt: proposal.executionConfirmedAt, plan: proposal.plan });
 });
 
 app.post('/api/futures/status', async (req, res) => {
@@ -1345,6 +1701,23 @@ app.post('/api/futures/status', async (req, res) => {
   const context = state.futuresContext;
   if (!proposal || proposal.proposalId !== body.proposalId || !context) {
     res.status(404).json({ success: false, error: 'Futures proposal not found' });
+    return;
+  }
+  if (proposal.status === body.status && body.orderId && proposal.orderId === body.orderId && proposal.receipt) {
+    if ((body.planId && body.planId !== proposal.plan?.planId)
+      || (body.planHash && body.planHash !== proposal.plan?.planHash)) {
+      res.status(409).json({ success: false, error: 'Idempotent Futures event identity does not match the original execution receipt' });
+      return;
+    }
+    res.json({ success: true, idempotent: true, status: proposal.status, orderId: proposal.orderId, filledPrice: proposal.filledPrice, executedQty: proposal.executedQty, receipt: proposal.receipt, riskState: currentRiskState() });
+    return;
+  }
+  if (body.planId && (!proposal.plan || body.planId !== proposal.plan.planId)) {
+    res.status(409).json({ success: false, error: 'Futures event plan ID does not match the approved immutable plan' });
+    return;
+  }
+  if (body.planHash && (!proposal.plan || body.planHash !== proposal.plan.planHash)) {
+    res.status(409).json({ success: false, error: 'Futures event plan hash does not match the approved immutable plan' });
     return;
   }
   if (!futuresToolNameAllowed(body.mcpToolName)) {
@@ -1370,6 +1743,10 @@ app.post('/api/futures/status', async (req, res) => {
   }
   if (body.status !== 'rejected' && body.status !== 'cancelled' && !proposal.executionConfirmedAt) {
     res.status(409).json({ success: false, error: 'The exact CONFIRM step is required before a live Futures order event' });
+    return;
+  }
+  if (body.status !== 'rejected' && body.status !== 'cancelled' && (!proposal.plan || !isExecutionPlanCurrent(proposal.plan) || proposal.plan.status === 'expired')) {
+    res.status(409).json({ success: false, error: 'The Futures execution plan is stale or already consumed' });
     return;
   }
   if (body.orderId && proposal.orderId && body.orderId !== proposal.orderId) {
@@ -1430,6 +1807,21 @@ app.post('/api/futures/status', async (req, res) => {
     reason: body.reason,
   };
   state.futuresEvents = [event, ...state.futuresEvents].slice(0, 50);
+  if (proposal.plan) {
+    let planStatus: 'submitted' | 'partially_filled' | 'filled' | 'refused' | 'cancelled' | 'expired' = 'cancelled';
+    if (body.status === 'submitted') planStatus = 'submitted';
+    else if (body.status === 'partially_filled') planStatus = 'partially_filled';
+    else if (body.status === 'filled') planStatus = 'filled';
+    else if (body.status === 'rejected') planStatus = 'refused';
+    try {
+      proposal.plan = body.status === 'filled'
+        ? transitionExecutionPlan(proposal.plan, 'filled')
+        : transitionExecutionPlan(proposal.plan, planStatus);
+    } catch (error: unknown) {
+      res.status(409).json({ success: false, error: error instanceof Error ? error.message : 'Futures execution plan transition failed' });
+      return;
+    }
+  }
   proposal.status = nextStatus;
   proposal.riskStatus = body.status === 'rejected' ? 'refused' : 'approved';
   proposal.orderId = body.orderId ?? proposal.orderId;
@@ -1442,10 +1834,50 @@ app.post('/api/futures/status', async (req, res) => {
   proposal.afterAccountSnapshot = body.afterAccountSnapshot ?? proposal.afterAccountSnapshot;
   proposal.beforePositionSnapshot = body.beforePositionSnapshot ?? proposal.beforePositionSnapshot;
   proposal.afterPositionSnapshot = body.afterPositionSnapshot ?? proposal.afterPositionSnapshot;
+  if (body.afterAccountSnapshot) {
+    const riskSnapshot = RISK_STATE.updateEquity(body.afterAccountSnapshot.walletBalanceUSDT);
+    state.riskState = riskSnapshot;
+    if (riskSnapshot.drawdownState === 'HALTED') await audit('risk.drawdown.halted', { proposalId: proposal.proposalId, equityUSDT: body.afterAccountSnapshot.walletBalanceUSDT });
+  }
+  if (body.status === 'filled' && proposal.plan && proposal.orderId && proposal.mcpToolName) {
+    const orderedEvents = [...state.futuresEvents].reverse().map((item, index) => ({
+      sequence: index + 1,
+      type: `${item.eventType}:${item.status}`,
+      observedAt: item.observedAt,
+      detail: { orderId: item.orderId, source: item.source, mcpToolName: item.mcpToolName },
+    }));
+    proposal.receipt = buildExecutionReceipt({
+      kind: 'futures',
+      proposalId: proposal.proposalId,
+      planId: proposal.plan.planId,
+      paymentReceiptId: proposal.paymentReceiptId,
+      contextHash: proposal.plan.contextHash,
+      riskHash: proposal.plan.riskHash,
+      approvalAt: proposal.approvalAt,
+      confirmationAt: proposal.executionConfirmedAt,
+      submittedAt: orderedEvents.find((item) => item.type.endsWith(':submitted'))?.observedAt ?? body.observedAt,
+      settledAt: body.observedAt,
+      mcpToolName: proposal.mcpToolName,
+      orderId: proposal.orderId,
+      filledPrice: proposal.filledPrice,
+      executedQty: proposal.executedQty,
+      quoteAmount: proposal.notionalUSDT,
+      beforePositions: proposal.beforePositionSnapshot,
+      afterPositions: proposal.afterPositionSnapshot,
+      events: orderedEvents,
+    });
+    if (!executionReceiptSchema.safeParse(proposal.receipt).success) {
+      res.status(500).json({ success: false, error: 'Futures execution receipt failed schema validation' });
+      return;
+    }
+  }
   proposal.updatedAt = new Date().toISOString();
   touch(`Futures ${body.status.replace('_', ' ')} event received${proposal.orderId ? ` for ${proposal.orderId}` : ''}.`);
   await audit(`seller.futures.${body.status}`, {
     proposalId: proposal.proposalId,
+    planId: proposal.plan?.planId,
+    planHash: proposal.plan?.planHash,
+    receiptId: proposal.receipt?.receiptId,
     eventType: body.eventType,
     orderId: proposal.orderId,
     filledPrice: proposal.filledPrice,
@@ -1453,7 +1885,7 @@ app.post('/api/futures/status', async (req, res) => {
     mcpToolName: body.mcpToolName,
     observedAt: body.observedAt,
   });
-  res.json({ success: true, status: proposal.status, orderId: proposal.orderId, filledPrice: proposal.filledPrice, executedQty: proposal.executedQty });
+  res.json({ success: true, status: proposal.status, orderId: proposal.orderId, filledPrice: proposal.filledPrice, executedQty: proposal.executedQty, plan: proposal.plan, receipt: proposal.receipt, riskState: currentRiskState() });
 });
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {

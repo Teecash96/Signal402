@@ -483,7 +483,20 @@ export function evaluateFuturesRisk(
     ],
     inputHash,
   } as Omit<FuturesRiskEnvelope, 'outputHash'>;
-  return { ...outputWithoutHash, outputHash: sha256(outputWithoutHash) };
+  // dataAgeMs is measured from the evaluator's wall clock. Keep it in the
+  // evidence shown to an operator, but exclude that volatile measurement from
+  // the proof hash so the same observed input always produces the same proof.
+  const hashableOutput = {
+    ...outputWithoutHash,
+    evidence: {
+      ...evidence,
+      checks: {
+        ...evidence.checks,
+        dataAgeMs: null,
+      },
+    },
+  };
+  return { ...outputWithoutHash, outputHash: sha256(hashableOutput) };
 }
 
 /** Backwards friendly name for callers that use the word assess. */

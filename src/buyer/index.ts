@@ -122,8 +122,14 @@ async function publishTradeFilled(
 ): Promise<void> {
   const price = filledPrice(order);
   if (price === undefined) throw new Error('MCP order response did not include a real filled price');
+  const proposalResponse = await axios.get(`${SELLER_ENDPOINT}/api/trade/proposal/${encodeURIComponent(proposalId)}`, sellerAuthConfig());
+  const plan = proposalResponse.data?.plan as { planId?: string; planHash?: string } | undefined;
+  if (!plan?.planId || !plan.planHash) throw new Error('Seller proposal did not return a current execution plan');
   await axios.post(`${SELLER_ENDPOINT}/api/trade/status`, {
     proposalId,
+    planId: plan.planId,
+    planHash: plan.planHash,
+    asset: signal.asset,
     amountUSDT: order.quoteAmount,
     status: 'filled',
     orderId: order.orderId,

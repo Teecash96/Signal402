@@ -36,6 +36,9 @@ export const tradeProposalInputSchema = z.object({
 
 export const tradeStatusInputSchema = z.object({
   proposalId: safeId,
+  planId: safeId.optional(),
+  planHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  asset: z.string().trim().min(1).max(30).regex(/^[A-Za-z0-9._-]+$/).optional(),
   status: z.enum(['refused', 'filled', 'cancelled']),
   reason: z.string().trim().min(1).max(500).optional(),
   orderId: safeId.optional(),
@@ -236,6 +239,8 @@ const futuresPositionSnapshotSchema = z.object({
 
 export const futuresStatusInputSchema = z.object({
   proposalId: safeId,
+  planId: safeId.optional(),
+  planHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   eventType: z.enum(['ORDER_TRADE_UPDATE', 'ACCOUNT_UPDATE', 'MARGIN_CALL']),
   status: z.enum(['submitted', 'partially_filled', 'filled', 'rejected', 'cancelled', 'liquidated']),
   orderId: safeId.optional(),
@@ -255,6 +260,125 @@ export const futuresStatusInputSchema = z.object({
 }).strict();
 
 export const emptyBodySchema = z.object({}).strict();
+
+export const executionPlanSchema = z.object({
+  schemaVersion: z.literal('signal402-execution-plan-v1'),
+  planId: safeId,
+  proposalId: safeId,
+  kind: z.enum(['spot', 'futures']),
+  symbol: z.string().trim().min(1).max(30).regex(/^[A-Za-z0-9._-]+$/),
+  side: z.enum(['BUY', 'SELL']),
+  positionSide: z.enum(['BOTH', 'LONG', 'SHORT']).optional(),
+  quantity: z.number().finite().positive().optional(),
+  notionalUSDT: z.number().finite().positive().max(10),
+  reduceOnly: z.boolean(),
+  leverage: z.number().finite().positive().max(3).optional(),
+  marginMode: z.literal('ISOLATED').optional(),
+  contextHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  riskHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  paymentReceiptId: z.string().min(1).max(200).optional(),
+  createdAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  status: z.enum(['proposed', 'approved', 'confirmed', 'submitted', 'partially_filled', 'filled', 'refused', 'cancelled', 'expired']),
+  planHash: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+
+const executionReceiptEventSchema = z.object({
+  sequence: z.number().int().positive(),
+  type: z.string().trim().min(1).max(100),
+  observedAt: z.string().datetime(),
+  detail: z.record(z.string(), z.unknown()).optional(),
+}).strict();
+
+export const executionReceiptSchema = z.object({
+  schemaVersion: z.literal('signal402-execution-receipt-v1'),
+  receiptId: safeId,
+  kind: z.enum(['spot', 'futures']),
+  proposalId: safeId,
+  planId: safeId,
+  paymentReceiptId: z.string().min(1).max(200).optional(),
+  contextHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  riskHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  approvalAt: z.string().datetime().optional(),
+  confirmationAt: z.string().datetime().optional(),
+  submittedAt: z.string().datetime().optional(),
+  settledAt: z.string().datetime().optional(),
+  mcpToolName: z.string().trim().min(1).max(200),
+  orderId: safeId,
+  filledPrice: z.number().finite().positive().optional(),
+  executedQty: z.number().finite().positive().optional(),
+  quoteAmount: z.number().finite().positive().max(10).optional(),
+  beforeBalances: z.unknown().optional(),
+  afterBalances: z.unknown().optional(),
+  beforePositions: z.unknown().optional(),
+  afterPositions: z.unknown().optional(),
+  events: z.array(executionReceiptEventSchema).max(100),
+  hash: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+
+export const carryContextSchema = z.object({
+  symbol: z.string().trim().min(1).max(30).regex(/^[A-Za-z0-9._-]+$/),
+  spotPrice: z.number().finite().positive(),
+  futuresMarkPrice: z.number().finite().positive(),
+  fundingRateBps: z.number().finite(),
+  fundingIntervalHours: z.number().finite().positive().max(168),
+  horizonHours: z.number().finite().positive().max(8760),
+  spotFeeRate: z.number().finite().nonnegative().max(1),
+  futuresFeeRate: z.number().finite().nonnegative().max(1),
+  spotSpreadBps: z.number().finite().nonnegative().max(10_000),
+  futuresSpreadBps: z.number().finite().nonnegative().max(10_000),
+  spotSlippageBps: z.number().finite().nonnegative().max(10_000),
+  futuresSlippageBps: z.number().finite().nonnegative().max(10_000),
+  observedAt: z.string().datetime(),
+  sourceToolNames: z.array(z.string().trim().min(1).max(200)).min(1).max(200),
+}).strict();
+
+export const carryReportSchema = z.object({
+  schemaVersion: z.literal('signal402-cex-carry-v1'),
+  methodologyVersion: z.literal('signal402-binance-cex-carry-v1'),
+  generatedAt: z.string().datetime(),
+  symbol: z.string().trim().min(1).max(30).regex(/^[A-Za-z0-9._-]+$/),
+  decision: z.enum(['ENTER', 'WAIT']),
+  reportOnly: z.literal(true),
+  dataFresh: z.boolean(),
+  dataAgeMs: z.number().finite().nonnegative().nullable(),
+  basisBps: z.number().finite(),
+  fundingCarryBps: z.number().finite(),
+  fundingSettlements: z.number().finite().nonnegative(),
+  roundTripCostBps: z.number().finite().nonnegative(),
+  netExpectedCarryBps: z.number().finite(),
+  breakEvenHours: z.number().finite().nonnegative().nullable(),
+  invalidationRule: z.string().min(1).max(1000),
+  assumptions: z.array(z.string().min(1).max(500)).max(20),
+  sourceToolNames: z.array(z.string().trim().min(1).max(200)).min(1).max(200),
+  inputHash: z.string().regex(/^[0-9a-f]{64}$/),
+  outputHash: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+
+export const riskStateSchema = z.object({
+  schemaVersion: z.literal('signal402-risk-state-v1'),
+  killSwitch: z.boolean(),
+  killSwitchReason: z.string().max(500).optional(),
+  drawdownState: z.enum(['NORMAL', 'WARN', 'HALTED']),
+  currentEquityUSDT: z.number().finite().nonnegative().optional(),
+  peakEquityUSDT: z.number().finite().nonnegative().optional(),
+  updatedAt: z.string().datetime(),
+}).strict();
+
+export const killSwitchInputSchema = z.object({
+  enabled: z.boolean(),
+  reason: z.string().trim().max(500).optional(),
+}).strict();
+
+export const resetHaltInputSchema = z.object({
+  confirm: z.literal('RESET_HALT'),
+  reason: z.string().trim().max(500).optional(),
+}).strict();
+
+export const equityUpdateSchema = z.object({
+  equityUSDT: z.number().finite().nonnegative(),
+}).strict();
 
 export function parseBody<T>(schema: z.ZodType<T>, body: unknown): { data?: T; error?: string } {
   const result = schema.safeParse(body);

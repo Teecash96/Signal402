@@ -80,7 +80,12 @@ flowchart LR
 | [`src/lib/binanceX402.ts`](./src/lib/binanceX402.ts) | Real Binance B402 seller verification and settlement |
 | [`src/lib/binanceX402Client.ts`](./src/lib/binanceX402Client.ts) | Real Agentic Wallet x402 payment client |
 | [`src/lib/futuresRisk.ts`](./src/lib/futuresRisk.ts) | Pure deterministic DeltaZero based Futures risk envelope |
+| [`src/lib/executionPlan.ts`](./src/lib/executionPlan.ts) | Hash bound, 60 second, single use execution plans |
+| [`src/lib/executionReceipt.ts`](./src/lib/executionReceipt.ts) | Ordered hash verified payment and order evidence |
+| [`src/lib/riskState.ts`](./src/lib/riskState.ts) | Persistent kill switch and equity drawdown state |
+| [`src/lib/carryEconomics.ts`](./src/lib/carryEconomics.ts) | Binance CEX Spot and Futures carry report, report only |
 | [`src/buyer/riskGuardian.ts`](./src/buyer/riskGuardian.ts) | Live USDT balance gate for Spot proposals |
+| [`.agents/skills/signal402-binance/`](./.agents/skills/signal402-binance/) | Reusable Agent Skills contract for real Binance operation |
 | [`test/`](./test/) | Deterministic risk, schema, security, payment, and fill proof tests |
 | [`web/`](./web/) | Safe public Vercel front door with no account data |
 | [`SIGNAL402_AGENT.md`](./SIGNAL402_AGENT.md) | Host contract and exact tool sequence |
@@ -98,6 +103,8 @@ Signal402 does not sell a raw ticker wrapper. It sells a verified market intelli
 The action is not a profit promise. `BUY_SMALL` only permits the next safety checks. `WAIT` blocks proposal creation. The Buyer still reads the live Agentic subaccount, applies Risk Guardian, and waits for dashboard approval. This is the reason for the 0.01 USDC payment: the Buyer pays for an independently produced, timestamped interpretation rather than free price access.
 
 The screening rules are visible and deterministic. A move of at least 1 percent is bullish, a move of at most negative 1 percent is bearish, and high risk starts at an absolute move of 8 percent or a 24 hour range of 12 percent. Only bullish, non high risk snapshots produce `BUY_SMALL`.
+
+Signal402 also publishes a Binance CEX carry report when the host supplies both Spot and Futures market inputs. It shows basis, signed funding carry, round trip fees, spread, slippage, net expected carry, and a break even estimate. It is a transparent research artifact. It is always `reportOnly` and cannot submit a Spot and Futures hedge.
 
 ## Public frontend and live console
 
@@ -221,7 +228,11 @@ The implementation follows the [Binance Agent OS agentic MCP documentation](http
 
 Binance Agent OS currently authorizes approved AI hosts. Signal402 therefore runs as a local MCP server beside the official Binance MCP server. The host owns Binance OAuth and calls both servers. Signal402 owns the marketplace state, x402 payment flow, Risk Guardian, dashboard approval gate, and append only audit log.
 
-The host bridge accepts only live market data and fill records that identify their Binance MCP source. It rejects missing runtime tool names, invalid balances, missing order fields, fills before dashboard approval, and amounts above the hard 10 USDT cap. Signal402 never accepts a simulated receipt.
+The host bridge accepts only live market data and fill records that identify their Binance MCP source. When publishing Spot data, pass the complete runtime discovered Binance tool list, including the balance and order tools that may be used after approval. It rejects missing runtime tool names, invalid balances, missing order fields, fills before dashboard approval, and amounts above the hard 10 USDT cap. Signal402 never accepts a simulated receipt.
+
+Every eligible proposal also receives a 60 second execution plan. The plan binds the exact symbol, side, quantity, notional, position side, reduce only value, existing leverage, margin mode, source hashes, payment receipt, and expiry. A plan can be approved once and consumed once. A changed or stale plan is refused. A reconciled live order produces an ordered execution receipt with the plan hash, real Binance MCP tool name, order ID, fill values, before and after account state, and a SHA 256 proof hash.
+
+The dashboard exposes a persistent risk control. An operator can enable the kill switch, and the host can publish live equity. A two percent drawdown shows a warning. A three percent drawdown halts new proposals. The state is written atomically to `state/signal402-risk.json`, which is ignored by Git. Clearing a kill switch never cancels an existing Binance order. A drawdown halt can be reset only from the authenticated dashboard after the recovery check and a typed `RESET_HALT` confirmation.
 
 The older direct `BinanceMcpClient` remains only as an isolated path for a future Binance approved client. It is not the default and must not be used to bypass the supported host flow.
 
@@ -262,6 +273,9 @@ The safety model is enforced in server code and strict schemas. It is not only a
 | Futures | Isolated margin only, existing leverage at or below 3x, combined notional at or below 10 USDT, and no automatic leverage or margin changes. |
 | Futures modes | Neutral analysis and all COIN M paths are report only. Directional USD M opening orders need a declared protective stop plan. |
 | Evidence | A fill is recorded only when Binance returns an order ID, filled price, quantities, and changed before and after account or position snapshots. |
+| Execution plan | A plan expires after 60 seconds, binds all order fields, and cannot be reused after a terminal state. |
+| Persistent controls | The operator kill switch and drawdown halt block new proposals across process restarts. |
+| Carry | Binance CEX carry is report only. It never creates a two leg hedge. |
 | Prohibited actions | No withdrawals, transfers, hidden retries, fake values, or public REST account and order reads. |
 
 No withdrawal permission is requested or available. In supported host mode, Binance OAuth tokens remain inside the supported MCP host and are never handled by Signal402. The isolated direct client is disabled unless Binance approves it and stores only an encrypted token cache. The order is always a Spot `MARKET BUY`, never larger than 10 USDT, and requires the dashboard `APPROVE` action. The host checks real USDT immediately before proposal and again immediately before order. It reads balances after the order and refuses to call the dashboard `filled` state unless Binance returns a real order ID and filled price. Every material action is appended to `logs/signal402.jsonl`; the log is ignored by Git.

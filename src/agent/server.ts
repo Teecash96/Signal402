@@ -17,6 +17,7 @@ import {
 } from '../lib/futuresRisk.js';
 import { isUsableSecret } from '../lib/securityConfig.js';
 import {
+  carryContextSchema,
   futuresContextSchema,
   futuresIntentSchema,
   futuresProposalInputSchema,
@@ -67,13 +68,14 @@ Signal402 is a real Binance Agent OS workflow. The supported MCP host owns Binan
 
 1. Discover the currently available Binance MCP tools at runtime. Do not invent or hardcode tool names.
 2. Call the Binance MCP market data tool for the requested symbol. Do not use public REST for account or trading data.
-3. Call signal402_publish_market with the live MCP result and the runtime tool names. Signal402 derives an explainable direction, risk tier, and BUY_SMALL or WAIT action from that snapshot.
+3. Call signal402_publish_market with the live MCP result and the complete list of runtime discovered Binance tool names, not only the ticker tool. Signal402 derives an explainable direction, risk tier, and BUY_SMALL or WAIT action from that snapshot.
 4. Call signal402_request_briefing to inspect the access mode. In paid mode, verify that the real B402 amount is 0.01 USDC and that the merchant terms are expected. In free mode, no payment is requested and no receipt exists.
 5. In paid mode, ask the human to approve that exact payment. Only then call signal402_pay_briefing with confirmPayment=true. In free mode, call signal402_pay_briefing only if you need the report body, and never invent or attach a receipt.
 6. Call the Binance MCP account balance tool. Pass the live USDT balance to signal402_create_proposal.
 7. If the Seller returns WAIT or a refused proposal, stop. Do not create an order. Otherwise wait for the human to press APPROVE in the Signal402 dashboard by calling signal402_wait_for_approval.
 8. Only after approved, call the Binance MCP Spot order tool with one MARKET BUY capped at 10 USDT. Use the live tool schema. Never submit an order before approval.
 9. Read the real order result and read balances again through Binance MCP. Call signal402_record_fill only with the real order ID, filled price, quantities, and before and after balances.
+10. Treat the returned immutable execution plan as single use. It expires after 60 seconds, and every fill must return a hash verified execution receipt.
 
 Futures branch, opt in with an explicit USD_M or COIN_M context:
 1. Discover runtime Futures tools and reject tools that are not clearly marked Futures, USD M, COIN M, perpetual, derivative, or contract tools.
@@ -143,9 +145,19 @@ server.registerTool('signal402_get_workflow', {
   description: 'Returns the mandatory real Binance Agent OS workflow. The host must use its configured Binance MCP tools for live data and orders.',
 }, async () => textResult(WORKFLOW));
 
+server.registerTool('signal402_get_capabilities', {
+  title: 'Read Signal402 capabilities',
+  description: 'Return the machine readable supported Binance CEX modes, limits, payment mode, provenance policy, and safety gates. No account secrets or balances are returned.',
+}, async () => jsonResult(await sellerRequest<Record<string, unknown>>('get', '/api/capabilities')));
+
+server.registerTool('signal402_get_risk_state', {
+  title: 'Read persistent risk controls',
+  description: 'Read the authenticated persistent kill switch and drawdown state. A halted state blocks new exposure.',
+}, async () => jsonResult(await sellerRequest<Record<string, unknown>>('get', '/api/risk/state')));
+
 server.registerTool('signal402_publish_market', {
   title: 'Publish live Binance MCP market data',
-  description: 'Publish a ticker read by the supported Binance MCP host to the Seller dashboard. Public REST and invented values are rejected.',
+  description: 'Publish a ticker read by the supported Binance MCP host to the Seller dashboard. Include every runtime discovered Binance tool name that may be used later for balances or orders. Public REST and invented values are rejected.',
   inputSchema: {
     symbol: z.string().min(1),
     price: z.number().finite().positive(),
@@ -197,6 +209,23 @@ server.registerTool('signal402_publish_futures_context', {
   });
   return jsonResult(result);
 });
+
+server.registerTool('signal402_publish_carry_context', {
+  title: 'Publish Binance CEX carry context',
+  description: 'Publish live Spot and Futures market inputs for a deterministic Binance CEX carry report. This path is report only and never submits a hedge.',
+  inputSchema: { ...carryContextSchema.shape },
+}, async (input) => {
+  const parsed = carryContextSchema.safeParse(input);
+  if (!parsed.success) throw new Error(`Invalid Binance CEX carry context: ${parsed.error.message}`);
+  const result = await sellerRequest<Record<string, unknown>>('post', '/api/host/carry/context', parsed.data);
+  await audit('host.carry.context.published', { symbol: parsed.data.symbol, sourceToolNames: parsed.data.sourceToolNames, observedAt: parsed.data.observedAt });
+  return jsonResult(result);
+});
+
+server.registerTool('signal402_get_carry_report', {
+  title: 'Read Binance CEX carry report',
+  description: 'Read the latest deterministic Spot and Futures carry report. It is report only and contains no order instruction.',
+}, async () => jsonResult(await sellerRequest<Record<string, unknown>>('get', '/api/carry/report')));
 
 server.registerTool('signal402_revalidate_futures_context', {
   title: 'Revalidate the approved Futures order',
@@ -437,6 +466,8 @@ server.registerTool('signal402_record_fill', {
   description: 'Record a fill only after the host has called the real Binance MCP Spot order and balance tools.',
   inputSchema: {
     proposalId: z.string().min(1),
+    planId: z.string().min(1).optional(),
+    planHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
     asset: z.string().min(1),
     orderId: z.string().min(1),
     filledPrice: z.number().finite().positive(),
@@ -446,7 +477,7 @@ server.registerTool('signal402_record_fill', {
     afterBalances: z.array(balanceSchema).min(1),
     mcpToolName: z.string().min(1),
   },
-}, async ({ proposalId, asset, orderId, filledPrice, executedQty, quoteAmount, beforeBalances, afterBalances, mcpToolName }) => {
+}, async ({ proposalId, planId, planHash, asset, orderId, filledPrice, executedQty, quoteAmount, beforeBalances, afterBalances, mcpToolName }) => {
   const proposal = await sellerRequest<Record<string, unknown>>('get', `/api/trade/proposal/${encodeURIComponent(proposalId)}`);
   if (proposal.status !== 'approved') throw new Error(`Proposal ${proposalId} is not approved. No fill can be recorded.`);
   const before = extractBalances(beforeBalances);
@@ -461,6 +492,9 @@ server.registerTool('signal402_record_fill', {
   }
   const result = await sellerRequest<Record<string, unknown>>('post', '/api/trade/status', {
     proposalId,
+    ...(planId ? { planId } : {}),
+    ...(planHash ? { planHash } : {}),
+    asset: asset.toUpperCase(),
     status: 'filled',
     orderId,
     filledPrice,
