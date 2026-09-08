@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Signal402 is an evidence-first decision layer for real Binance Agent OS trading." />
+    <meta name="theme-color" content="#071018" />
+    <title>Signal402 | Binance Agent OS control room</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <a class="wordmark" href="/" aria-label="Signal402 home">
+          <span class="wordmark-mark">S4</span>
+          <span>Signal402</span>
+        </a>
+        <div class="topbar-meta">
+          <span class="system-chip"><span class="status-dot"></span> Agent OS</span>
+          <span class="system-chip system-chip-muted">No credentials in browser</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero" aria-labelledby="hero-title">
+          <div class="hero-copy">
+            <p class="eyebrow">Signal402 / Binance Agent OS</p>
+            <h1 id="hero-title">A decision layer for agent trading.</h1>
+            <p class="hero-lede">Signal402 turns live Binance context into an evidence backed decision. A second agent can request a briefing, but a real order is only possible after strict risk checks, dashboard approval, and explicit confirmation.</p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="http://localhost:3001/">Open local operator console <span aria-hidden="true">↗</span></a>
+              <a class="button button-secondary" href="https://github.com/Teecash96/Signal402" rel="noreferrer">Read the source <span aria-hidden="true">↗</span></a>
+            </div>
+            <p class="local-note"><span class="status-dot status-dot-amber"></span> This public page is a safe front door. The live console stays with the authenticated agent host.</p>
+          </div>
+
+          <div class="workflow-card" aria-label="Signal402 workflow">
+            <div class="workflow-header">
+              <div>
+                <p class="eyebrow">Control path</p>
+                <h2>Evidence before execution</h2>
+              </div>
+              <span class="state-pill state-pill-muted">CONNECTION REQUIRED</span>
+            </div>
+            <ol class="workflow-list">
+              <li><span class="step-number">01</span><span><strong>Context</strong><small>Binance MCP market and account reads</small></span><span class="step-state">WAITING</span></li>
+              <li><span class="step-number">02</span><span><strong>Risk envelope</strong><small>Deterministic checks with an evidence hash</small></span><span class="step-state">WAITING</span></li>
+              <li><span class="step-number">03</span><span><strong>Human approval</strong><small>Exact symbol, side, quantity, and cap</small></span><span class="step-state">LOCKED</span></li>
+              <li><span class="step-number">04</span><span><strong>Reconciliation</strong><small>Real order event, fill, position, and balance</small></span><span class="step-state">LOCKED</span></li>
+            </ol>
+            <div class="workflow-footer"><span class="status-dot status-dot-red"></span><span>No simulated receipts, fills, balances, or order IDs.</span></div>
+          </div>
+        </section>
+
+        <section class="section-grid" aria-label="Product boundaries">
+          <article class="info-panel panel-teal">
+            <p class="eyebrow">What the agent does</p>
+            <h2>It sells clarity, not a promise.</h2>
+            <ul class="check-list">
+              <li>Publishes a live Spot or Futures briefing through the Seller Agent.</li>
+              <li>Uses Binance MCP data and runtime tool discovery when connected.</li>
+              <li>Runs DeltaZero style risk gates before any executable proposal.</li>
+              <li>Records real B402 settlement and real Binance order evidence only.</li>
+            </ul>
+          </article>
+          <article class="info-panel panel-amber">
+            <p class="eyebrow">Hard boundaries</p>
+            <h2>The control room can say no.</h2>
+            <ul class="check-list">
+              <li>No withdrawals, transfers, or credential handling in Signal402.</li>
+              <li>Every order needs dashboard approval and a final <code>CONFIRM</code>.</li>
+              <li>Futures are isolated margin, maximum 3x leverage, maximum 10 USDT notional.</li>
+              <li>Neutral and COIN M Futures paths are report only in v1.</li>
+            </ul>
+          </article>
+        </section>
+
+        <section class="futures-strip" aria-labelledby="futures-title">
+          <div>
+            <p class="eyebrow">Futures mode</p>
+            <h2 id="futures-title">Risk first. Direction second.</h2>
+          </div>
+          <div class="futures-rules">
+            <span>USDⓈ M directional</span><span>Isolated only</span><span>≤ 3x</span><span>≤ 10 USDT</span><span>No automatic leverage changes</span>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <span>Signal402</span>
+        <span>Real account workflow · fail closed by design</span>
+        <a href="https://github.com/Teecash96/Signal402" rel="noreferrer">GitHub ↗</a>
+      </footer>
+    </div>
+  </body>
+</html>

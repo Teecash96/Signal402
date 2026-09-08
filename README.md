@@ -18,6 +18,12 @@ The action is not a profit promise. `BUY_SMALL` only permits the next safety che
 
 The screening rules are visible and deterministic. A move of at least 1 percent is bullish, a move of at most negative 1 percent is bearish, and high risk starts at an absolute move of 8 percent or a 24 hour range of 12 percent. Only bullish, non high risk snapshots produce `BUY_SMALL`.
 
+## Public frontend and live console
+
+The repository includes a small public Vercel front door in [`web/`](./web/). It explains the workflow and its hard boundaries without exposing credentials, balances, payment data, or fake market values. The live operator console is the Express app at `http://localhost:3001` because its authenticated approval state, Binance OAuth host connection, and audit trail must remain on a stateful agent host. A Vercel static deployment is therefore a product entry point, not a claim that Vercel is executing trades.
+
+The local console uses a compact execution control room layout. It keeps MCP state, data source, access mode, risk status, approval, order evidence, and the Futures event trail visible. A `MCP: FALLBACK` label means the optional public REST source is active. It never means that Binance account or order data came from the fallback.
+
 ## Temporary free access
 
 If B402 merchant onboarding is not available yet, set `SIGNAL402_FREE_ACCESS=true` in `.env`. The Seller then returns the live briefing without requesting payment. The response has no receipt and the dashboard shows `ACCESS: FREE`. This mode does not create a fake receipt and does not weaken live Binance MCP data, Risk Guardian, dashboard approval, the 10 USDT order cap, or audit logging. Paid B402 mode remains the default. Never describe a free briefing as a settled B402 payment.

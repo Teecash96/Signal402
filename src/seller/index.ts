@@ -614,10 +614,34 @@ app.get('/', (_req, res) => {
 <title>Signal402 Agent OS</title><script nonce="${nonce}" src="https://cdn.tailwindcss.com"></script>
 <script nonce="${nonce}">tailwind.config={theme:{extend:{colors:{ink:'#070b14',panel:'#0d1422',line:'#1d2a3d',cyan:'#67e8f9',lime:'#bef264'}}}}</script>
 ${turnstileScript}
-<style>body{background:#070b14;color:#e5edf7;font-family:Inter,ui-sans-serif,system-ui}.glow{box-shadow:0 0 36px rgba(34,211,238,.10)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}</style></head>
+<style>
+:root{--bg:#071018;--surface:#0d1922;--surface-raised:#11232d;--line:#233944;--text:#edf5f3;--muted:#91a5a8;--teal:#5eead4;--lime:#b8e986;--amber:#f4c95d;--red:#fb7185}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;background:radial-gradient(circle at 86% -10%,rgba(94,234,212,.09),transparent 32rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:-.01em}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.22;background-image:linear-gradient(rgba(145,165,168,.08) 1px,transparent 1px),linear-gradient(90deg,rgba(145,165,168,.08) 1px,transparent 1px);background-size:32px 32px;mask-image:linear-gradient(to bottom,black,transparent 72%)}
+main{position:relative;max-width:1480px!important;padding-top:2rem!important;padding-bottom:3rem!important}
+.glow{box-shadow:none!important;background:rgba(13,25,34,.94)!important;border-color:var(--line)!important;border-radius:18px!important}
+main>header{border-color:var(--line)!important}
+main>header h1{max-width:760px;font-size:clamp(1.8rem,4vw,3.1rem)!important;line-height:1.06!important;letter-spacing:-.045em}
+main>header p{max-width:720px!important;color:var(--muted)!important}
+main article{position:relative;overflow:hidden}
+main article:before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:linear-gradient(180deg,var(--teal),transparent 72%);opacity:.72}
+main article:nth-child(2):before{background:linear-gradient(180deg,var(--lime),transparent 72%)}
+main article>div:first-child h2{letter-spacing:-.035em}
+main article .bg-ink{background:rgba(7,16,24,.68)!important;border-color:rgba(35,57,68,.95)!important;border-radius:12px!important}
+main article .bg-panel{background:rgba(17,35,45,.7)!important}
+main article button{min-height:44px;letter-spacing:.04em}
+#loginPanel{background:rgba(4,10,14,.94)!important;backdrop-filter:blur(14px)}
+#loginForm{border-radius:18px!important;background:rgba(13,25,34,.98)!important;border-color:var(--line)!important;box-shadow:0 24px 80px rgba(0,0,0,.42)!important}
+#loginForm input{min-height:44px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;letter-spacing:-.02em}
+@media (max-width:640px){main{padding-left:1rem!important;padding-right:1rem!important;padding-top:1rem!important}main>header{margin-bottom:1.25rem!important;padding-bottom:1.25rem!important}main article{padding:1.1rem!important}main article .grid{gap:.65rem}main article .text-2xl{font-size:1.2rem;line-height:1.2}}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+</style></head>
 <body><div id="loginPanel" class="fixed inset-0 z-50 flex items-center justify-center bg-ink/95 px-5"><form id="loginForm" class="w-full max-w-sm rounded-2xl border border-line bg-panel p-6 shadow-2xl"><p class="text-xs uppercase tracking-[.24em] text-cyan">Signal402 dashboard</p><h2 class="mt-3 text-2xl font-semibold">Sign in to approve trades</h2><p class="mt-3 text-sm leading-6 text-slate-400">The dashboard can show public market status, but order approval requires a server side session.</p><label class="mt-5 block text-sm text-slate-300" for="password">Dashboard password</label><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256" class="mt-2 w-full rounded-lg border border-line bg-ink px-3 py-3 text-sm text-white outline-none focus:border-cyan"><input id="turnstileToken" name="turnstileToken" type="hidden"><input name="website" type="text" tabindex="-1" autocomplete="off" class="hidden">${turnstileWidget}<button class="mt-5 w-full rounded-xl bg-cyan px-4 py-3 text-sm font-bold text-ink">SIGN IN</button><p id="loginError" class="mt-3 min-h-5 text-sm text-rose-300" role="alert"></p></form></div><main class="mx-auto min-h-screen max-w-7xl px-5 py-8 lg:px-10">
 <header class="mb-8 flex flex-col gap-5 border-b border-line pb-6 sm:flex-row sm:items-end sm:justify-between">
-<div><div class="mb-2 flex items-center gap-3"><span class="rounded-full border border-cyan/30 bg-cyan/10 px-3 py-1 text-xs font-bold tracking-[.25em] text-cyan">SIGNAL402</span><span class="text-xs uppercase tracking-[.22em] text-slate-500">Binance Agent OS</span></div><h1 class="text-3xl font-semibold tracking-tight sm:text-5xl">Agent-to-agent market intelligence</h1><p class="mt-3 max-w-2xl text-sm leading-6 text-slate-400">A live Seller Agent publishes ${FREE_ACCESS ? 'free' : 'paid'} Spot or Futures intelligence. Directional USD M orders pass a deterministic risk gate, dashboard approval, and a final CONFIRM step. Neutral and COIN M paths are report only.</p></div>
+<div><div class="mb-3 flex items-center gap-3"><span class="rounded-full border border-cyan/30 bg-cyan/10 px-3 py-1 text-xs font-bold tracking-[.25em] text-cyan">SIGNAL402</span><span class="text-xs uppercase tracking-[.22em] text-slate-500">Binance Agent OS</span></div><p class="mono mb-3 text-[10px] font-semibold uppercase tracking-[.28em] text-slate-500">Execution control room / live evidence only</p><h1 class="text-3xl font-semibold tracking-tight sm:text-5xl">The decision layer for agent trading</h1><p class="mt-3 max-w-2xl text-sm leading-6 text-slate-400">A live Seller Agent publishes ${FREE_ACCESS ? 'free' : 'paid'} Spot or Futures intelligence. Directional USD M orders pass a deterministic risk gate, dashboard approval, and a final CONFIRM step. Neutral and COIN M paths are report only.</p></div>
 <div class="flex flex-wrap gap-2 text-xs font-semibold"><span id="mcpBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">MCP: CONNECTING</span><span id="sourceBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">DATA: WAITING</span><span id="paymentModeBadge" class="rounded-full border ${FREE_ACCESS ? 'border-amber-500/40 bg-amber-500/10 text-amber-300' : 'border-cyan/30 bg-cyan/10 text-cyan'} px-3 py-2">${FREE_ACCESS ? 'ACCESS: FREE' : 'PAYMENT: B402'}</span><span class="rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-rose-300">WITHDRAWAL: NEVER</span><button id="logout" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">SIGN OUT</button></div>
 </header>
 <section class="grid gap-5 lg:grid-cols-[1.1fr_.9fr]">
