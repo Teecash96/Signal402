@@ -48,4 +48,7 @@ const r = 8;
 const p = 1;
 const salt = randomBytes(16);
 const hash = scryptSync(password, salt, 32, { N: n, r, p, maxmem: 64 * 1024 * 1024 });
-process.stdout.write(`SIGNAL402_DASHBOARD_PASSWORD_HASH=scrypt$${n}$${r}$${p}$${salt.toString('base64url')}$${hash.toString('base64url')}\n`);
+const encoded = `scrypt$${n}$${r}$${p}$${salt.toString('base64url')}$${hash.toString('base64url')}`;
+// Single quotes keep the '$' separators intact when this line is copied into
+// .env and the file is sourced by a POSIX shell.
+process.stdout.write(`SIGNAL402_DASHBOARD_PASSWORD_HASH='${encoded}'\n`);

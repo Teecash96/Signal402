@@ -55,7 +55,7 @@ The Binance MCP account and the B402 wallet are different Binance products. The 
    npm run hash:dashboard-password
    ```
 
-   Copy the printed `SIGNAL402_DASHBOARD_PASSWORD_HASH` line into `.env`. Set `SIGNAL402_DASHBOARD_SESSION_SECRET` and `MCP_TOKEN_ENCRYPTION_KEY` to separate random values. The dashboard approval route has a server side session, secure cookie settings, a five failure login limit, and a honeypot. Set the optional Cloudflare Turnstile keys to add challenge verification.
+   Copy the printed `SIGNAL402_DASHBOARD_PASSWORD_HASH` line into `.env`. The helper prints shell quotes around the scrypt value so its `$` separators stay intact. Set `SIGNAL402_DASHBOARD_SESSION_SECRET` and `MCP_TOKEN_ENCRYPTION_KEY` to separate random values. The dashboard approval route has a server side session, secure cookie settings, a five failure login limit, and a honeypot. Set the optional Cloudflare Turnstile keys to add challenge verification. Do not run `source .env`; the application loads `.env` itself.
 
 4. Apply for Binance B402 merchant credentials. Binance provides the production base URL, `clientId`, and `accessToken` after onboarding. Generate the RSA key pair locally, submit only the public key, keep the private key locally, and set a seller BSC address in `B402_PAY_TO`. This repository refuses to issue a fake challenge when these values are missing. If onboarding is unavailable, use the temporary free access mode above.
 
