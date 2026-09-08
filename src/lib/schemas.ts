@@ -30,7 +30,8 @@ export const tradeProposalInputSchema = z.object({
   amountUSDT: z.number().finite().positive().max(10),
   balanceUSDT: z.number().finite().nonnegative(),
   reason: z.string().trim().min(1).max(500),
-  paymentReceiptId: txHash,
+  // Required by the seller in paid mode. Free mode intentionally omits it.
+  paymentReceiptId: txHash.optional(),
 }).strict();
 
 export const tradeStatusInputSchema = z.object({
@@ -200,7 +201,8 @@ export const futuresRiskEnvelopeSchema = z.object({
 
 export const futuresProposalInputSchema = z.object({
   proposalId: safeId,
-  paymentReceiptId: txHash,
+  // Required by the seller in paid mode. Free mode intentionally omits it.
+  paymentReceiptId: txHash.optional(),
   analysisId: safeId,
   marketType: z.enum(['USD_M', 'COIN_M']),
   strategyMode: z.enum(['directional', 'neutral']),

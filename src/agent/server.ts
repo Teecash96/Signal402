@@ -68,8 +68,8 @@ Signal402 is a real Binance Agent OS workflow. The supported MCP host owns Binan
 1. Discover the currently available Binance MCP tools at runtime. Do not invent or hardcode tool names.
 2. Call the Binance MCP market data tool for the requested symbol. Do not use public REST for account or trading data.
 3. Call signal402_publish_market with the live MCP result and the runtime tool names. Signal402 derives an explainable direction, risk tier, and BUY_SMALL or WAIT action from that snapshot.
-4. Call signal402_request_briefing to inspect the real B402 payment terms. Verify that the amount is 0.01 USDC and that the merchant terms are expected.
-5. Ask the human to approve that exact payment. Only then call signal402_pay_briefing with confirmPayment=true.
+4. Call signal402_request_briefing to inspect the access mode. In paid mode, verify that the real B402 amount is 0.01 USDC and that the merchant terms are expected. In free mode, no payment is requested and no receipt exists.
+5. In paid mode, ask the human to approve that exact payment. Only then call signal402_pay_briefing with confirmPayment=true. In free mode, call signal402_pay_briefing only if you need the report body, and never invent or attach a receipt.
 6. Call the Binance MCP account balance tool. Pass the live USDT balance to signal402_create_proposal.
 7. If the Seller returns WAIT or a refused proposal, stop. Do not create an order. Otherwise wait for the human to press APPROVE in the Signal402 dashboard by calling signal402_wait_for_approval.
 8. Only after approved, call the Binance MCP Spot order tool with one MARKET BUY capped at 10 USDT. Use the live tool schema. Never submit an order before approval.
@@ -244,30 +244,46 @@ server.registerTool('signal402_assess_futures_risk', {
 });
 
 server.registerTool('signal402_request_briefing', {
-  title: 'Request the real B402 terms',
-  description: 'Request the Seller payment challenge without signing or sending a payment.',
+  title: 'Request Seller briefing access',
+  description: 'Request the Seller access response. Paid mode returns a real B402 challenge. Free mode returns the live briefing without requesting payment.',
 }, async () => {
   const challenge = await requestReportChallenge(SELLER_ENDPOINT);
   pendingPaymentChallenge = challenge;
   pendingPaymentChallengeAt = Date.now();
-  await audit('host.briefing.challenge', { url: challenge.url });
+  await audit(challenge.accessMode === 'free' ? 'host.briefing.free' : 'host.briefing.challenge', { url: challenge.url, accessMode: challenge.accessMode });
   return jsonResult({
     url: challenge.url,
-    paymentRequirements: challenge.paymentRequirements,
+    accessMode: challenge.accessMode,
+    ...(challenge.paymentRequirements ? { paymentRequirements: challenge.paymentRequirements } : {}),
     challenge: challenge.body,
-    nextStep: 'Verify the exact 0.01 USDC terms with the human before paying.',
+    nextStep: challenge.accessMode === 'free'
+      ? 'Free access is enabled. No payment was requested. Continue to live risk checks.'
+      : 'Verify the exact 0.01 USDC terms with the human before paying.',
   });
 });
 
 server.registerTool('signal402_pay_briefing', {
-  title: 'Pay for the briefing with Binance Agentic Wallet',
-  description: 'Pay the real B402 challenge. confirmPayment must be true only after the human approves the exact payment terms.',
+  title: 'Settle or retrieve the Seller briefing',
+  description: 'Pay the real B402 challenge in paid mode. Free mode skips payment and returns no receipt.',
   inputSchema: { confirmPayment: z.boolean() },
 }, async ({ confirmPayment }) => {
   if (!pendingPaymentChallenge || Date.now() - pendingPaymentChallengeAt > PAYMENT_CHALLENGE_TTL_MS) {
     pendingPaymentChallenge = undefined;
     pendingPaymentChallengeAt = 0;
     throw new Error('No fresh payment challenge is pending. Call signal402_request_briefing first.');
+  }
+  if (pendingPaymentChallenge.accessMode === 'free') {
+    const freeChallenge = pendingPaymentChallenge;
+    pendingPaymentChallenge = undefined;
+    pendingPaymentChallengeAt = 0;
+    await audit('host.briefing.free.returned', { url: freeChallenge.url });
+    return jsonResult({
+      paid: false,
+      accessMode: 'free',
+      paymentReceiptId: null,
+      report: freeChallenge.body,
+      message: 'Free access is enabled. No payment was requested or signed.',
+    });
   }
   if (!confirmPayment) return jsonResult({
     paid: false,
@@ -285,7 +301,7 @@ server.registerTool('signal402_pay_briefing', {
   }
   const report = await payReportChallenge(currentChallenge, { explicitlyApproved: true });
   await audit('host.briefing.paid', { paymentReceiptId: report.paymentReceiptId });
-  return jsonResult({ paid: true, paymentReceiptId: report.paymentReceiptId, report: report.body });
+  return jsonResult({ paid: true, accessMode: report.accessMode, paymentReceiptId: report.paymentReceiptId, report: report.body });
 });
 
 server.registerTool('signal402_assess_risk', {
@@ -299,13 +315,13 @@ server.registerTool('signal402_assess_risk', {
 
 server.registerTool('signal402_create_proposal', {
   title: 'Create a human gated trade proposal',
-  description: 'Create a proposal from live Binance MCP balance data. Refused proposals never create an order intent.',
+  description: 'Create a proposal from live Binance MCP balance data. Paid mode requires the exact B402 receipt. Free mode omits the receipt. Refused proposals never create an order intent.',
   inputSchema: {
     proposalId: z.string().min(1).optional(),
     asset: z.string().min(1),
     amountUSDT: z.number().finite().positive().max(MAX_TRADE_SIZE_USDT),
     balanceUSDT: z.number().finite(),
-    paymentReceiptId: z.string().min(1),
+    paymentReceiptId: z.string().min(1).optional(),
     reason: z.string().min(1),
   },
 }, async ({ proposalId, asset, amountUSDT, balanceUSDT, paymentReceiptId, reason }) => {
@@ -318,7 +334,7 @@ server.registerTool('signal402_create_proposal', {
     amountUSDT,
     balanceUSDT,
     reason: `${reason}. ${assessment.reason}`.slice(0, 500),
-    paymentReceiptId,
+    ...(paymentReceiptId ? { paymentReceiptId } : {}),
   });
   await audit('host.trade.proposal', { proposalId: id, asset: asset.toUpperCase(), amountUSDT, balanceUSDT, approved: assessment.approved });
   return jsonResult({ ...result, assessment, proposalId: id });
@@ -326,7 +342,7 @@ server.registerTool('signal402_create_proposal', {
 
 server.registerTool('signal402_create_futures_proposal', {
   title: 'Create a human gated Futures proposal',
-  description: 'Create a USD M directional proposal only from a deterministic risk envelope and a real B402 receipt. Neutral and COIN M proposals remain report only.',
+  description: 'Create a USD M directional proposal only from a deterministic risk envelope. Paid mode requires a real B402 receipt. Free mode omits the receipt. Neutral and COIN M proposals remain report only.',
   inputSchema: { ...futuresProposalInputSchema.shape },
 }, async (input) => {
   const parsed = futuresProposalInputSchema.safeParse(input);

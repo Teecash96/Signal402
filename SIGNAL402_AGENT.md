@@ -13,9 +13,9 @@ Use the Signal402 MCP server for marketplace state, x402 payment, risk checks, d
 1. Discover Binance MCP tools at runtime. Never invent or hardcode Binance tool names.
 2. Read the requested Spot ticker through Binance MCP.
 3. Publish that result with `signal402_publish_market`.
-4. Request the Seller payment challenge with `signal402_request_briefing`.
-5. Show the human the exact 0.01 USDC terms. Call `signal402_pay_briefing` with `confirmPayment=true` only after explicit approval.
-6. Read the paid briefing. If its rule action is `WAIT`, stop and report the thesis. Do not create a proposal or order.
+4. Request the Seller access response with `signal402_request_briefing`.
+5. In paid mode, show the human the exact 0.01 USDC terms and call `signal402_pay_briefing` with `confirmPayment=true` only after explicit approval. In free mode, no payment is requested, no receipt exists, and the live report may be used directly. Never invent a receipt.
+6. Read the briefing. If its rule action is `WAIT`, stop and report the thesis. Do not create a proposal or order.
 7. Read the live Spot account balance through Binance MCP.
 8. Create a proposal with `signal402_create_proposal`. The Seller also enforces the briefing action, and the Risk Guardian refuses when free USDT is below the proposed size.
 9. Wait for the human dashboard `APPROVE` using `signal402_wait_for_approval`.
@@ -31,7 +31,7 @@ Spot remains the default. Use this branch only when the human has selected an ex
 1. Discover runtime Binance Futures tools. Accept only tools clearly identified as Futures, USD M, COIN M, perpetual, derivative, or contract tools. Never guess a name.
 2. Read mark price, index price, bid, ask, order book depth, estimated slippage, funding and next funding time, wallet and available margin, initial and maintenance margin, positions, open orders, liquidation data, exchange filters, and leverage brackets. Publish the strict snapshot with `signal402_publish_futures_context`.
 3. Call `signal402_assess_futures_risk`. The deterministic envelope is based on the DeltaZero evidence and proof model. It fails closed when data is older than 15 seconds, margin is cross, leverage is above 3x, combined notional is above 10 USDT, margin is insufficient, required fields are missing, spread or slippage is above 50 basis points, funding is above 5 basis points per interval, liquidation distance is below 10 percent, or filters cannot be verified.
-4. Request the real B402 challenge and show the human the exact 0.01 USDC terms. Pay only after payment approval. The Futures report is withheld until settlement verification succeeds.
+4. Request the real B402 challenge and show the human the exact 0.01 USDC terms in paid mode. Pay only after payment approval. If `SIGNAL402_FREE_ACCESS=true`, the report is explicitly free and no receipt is created. The Futures risk and execution gates remain unchanged.
 5. Neutral mode returns a hedge ratio and evidence but is `REPORT ONLY`. It never submits two hedge legs. COIN M is also `REPORT ONLY` and never accepts an order write.
 6. Directional USD M can create a proposal only when `executionEligible=true` and the order includes a declared protective stop plan supported by the live host. The Seller checks the proof hashes against its current context.
 7. Wait for the dashboard `APPROVE`. Then require the human to type `CONFIRM` for the exact symbol, side, position side, quantity, notional, and `reduceOnly` value.

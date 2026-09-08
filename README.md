@@ -18,6 +18,10 @@ The action is not a profit promise. `BUY_SMALL` only permits the next safety che
 
 The screening rules are visible and deterministic. A move of at least 1 percent is bullish, a move of at most negative 1 percent is bearish, and high risk starts at an absolute move of 8 percent or a 24 hour range of 12 percent. Only bullish, non high risk snapshots produce `BUY_SMALL`.
 
+## Temporary free access
+
+If B402 merchant onboarding is not available yet, set `SIGNAL402_FREE_ACCESS=true` in `.env`. The Seller then returns the live briefing without requesting payment. The response has no receipt and the dashboard shows `ACCESS: FREE`. This mode does not create a fake receipt and does not weaken live Binance MCP data, Risk Guardian, dashboard approval, the 10 USDT order cap, or audit logging. Paid B402 mode remains the default. Never describe a free briefing as a settled B402 payment.
+
 ## Run with your own account
 
 The Binance MCP account and the B402 wallet are different Binance products. The Spot order uses the Binance Agentic subaccount. The x402 payment uses the Binance Agentic Wallet on BSC. Fund both with small amounts before using production funds.
@@ -47,9 +51,9 @@ The Binance MCP account and the B402 wallet are different Binance products. The 
 
    Copy the printed `SIGNAL402_DASHBOARD_PASSWORD_HASH` line into `.env`. Set `SIGNAL402_DASHBOARD_SESSION_SECRET` and `MCP_TOKEN_ENCRYPTION_KEY` to separate random values. The dashboard approval route has a server side session, secure cookie settings, a five failure login limit, and a honeypot. Set the optional Cloudflare Turnstile keys to add challenge verification.
 
-4. Apply for Binance B402 merchant credentials. Binance gives the production base URL, `clientId`, `accessToken`, and the Base64 PKCS#8 RSA private key after onboarding. Set them in `.env`, together with a seller BSC address in `B402_PAY_TO`. This repository refuses to issue a fake challenge when these values are missing.
+4. Apply for Binance B402 merchant credentials. Binance provides the production base URL, `clientId`, and `accessToken` after onboarding. Generate the RSA key pair locally, submit only the public key, keep the private key locally, and set a seller BSC address in `B402_PAY_TO`. This repository refuses to issue a fake challenge when these values are missing. If onboarding is unavailable, use the temporary free access mode above.
 
-5. Install and log in to the Binance Agentic Wallet CLI. The executable must be available as `baw`, or set `BINANCE_AGENTIC_WALLET_BIN` to its path. The payment tool uses the documented `baw x402-payment preview` and `baw x402-payment sign` commands.
+5. For paid mode, install and log in to the Binance Agentic Wallet CLI. The executable must be available as `baw`, or set `BINANCE_AGENTIC_WALLET_BIN` to its path. The payment tool uses the documented `baw x402-payment preview` and `baw x402-payment sign` commands. You can skip this step while temporary free access is enabled.
 
 6. Start the Seller.
 
@@ -77,7 +81,7 @@ The Binance MCP account and the B402 wallet are different Binance products. The 
 
 9. Fund the Agentic subaccount with USDT using the Binance web UI. The documented path is Profile, Dashboard, Subaccount, Asset Management, Transfer. Keep at least 10 USDT available for the capped Spot order.
 
-10. In the supported host, call `signal402_get_workflow` and follow the returned workflow. The host discovers Binance tool names at runtime, publishes the live market snapshot, pays the real 0.01 USDC challenge after human confirmation, stops when the Seller returns `WAIT`, or creates the proposal when the Seller returns `BUY_SMALL`. It then waits for the dashboard `APPROVE`, submits one real MARKET BUY capped at 10 USDT, reads the real fill and balances, and records the receipt.
+10. In the supported host, call `signal402_get_workflow` and follow the returned workflow. The host discovers Binance tool names at runtime, publishes the live market snapshot, pays the real 0.01 USDC challenge after human confirmation in paid mode, or continues without payment in free mode. It stops when the Seller returns `WAIT`, or creates the proposal when the Seller returns `BUY_SMALL`. It then waits for the dashboard `APPROVE`, submits one real MARKET BUY capped at 10 USDT, reads the real fill and balances, and records the receipt only in paid mode.
 
 The full agent contract is in [`SIGNAL402_AGENT.md`](./SIGNAL402_AGENT.md). Load it in the supported host before enabling trading.
 

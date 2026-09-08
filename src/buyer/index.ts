@@ -75,7 +75,7 @@ async function publishRiskRefusal(
   return proposalId;
 }
 
-async function createTradeProposal(signal: Signal, risk: RiskAssessment, paymentReceiptId: string): Promise<string> {
+async function createTradeProposal(signal: Signal, risk: RiskAssessment, paymentReceiptId: string | undefined): Promise<string> {
   const proposalId = `proposal_${Date.now()}`;
   const response = await axios.post(`${SELLER_ENDPOINT}/api/trade/proposal`, {
     proposalId,
@@ -84,7 +84,7 @@ async function createTradeProposal(signal: Signal, risk: RiskAssessment, payment
     amountUSDT: risk.proposedSizeUSDT,
     balanceUSDT: risk.balanceUSDT,
     reason: risk.reason,
-    paymentReceiptId,
+    ...(paymentReceiptId ? { paymentReceiptId } : {}),
   }, sellerAuthConfig());
   if (!response.data?.proposalId) throw new Error('Seller did not create a trade proposal');
   await audit('buyer.trade.proposed', { proposalId, asset: signal.asset, amountUSDT: risk.proposedSizeUSDT, balanceUSDT: risk.balanceUSDT });
@@ -171,7 +171,7 @@ async function runBuyerAgent(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  console.log(`\nSIGNAL402 BUYER AGENT\nReal Binance payment, real MCP account reads, real Spot order after dashboard approval.\nOrder cap: ${MAX_TRADE_SIZE_USDT.toFixed(2)} USDT\n`);
+  console.log(`\nSIGNAL402 BUYER AGENT\n${process.env.SIGNAL402_FREE_ACCESS === 'true' ? 'Free briefing, real MCP account reads, real Spot order after dashboard approval.' : 'Real Binance payment, real MCP account reads, real Spot order after dashboard approval.'}\nOrder cap: ${MAX_TRADE_SIZE_USDT.toFixed(2)} USDT\n`);
   if (configuredMax > 10) console.log('MAX_TRADE_SIZE_USDT was above the hard 10 USDT safety cap. It was reduced to 10 USDT.');
   const mcp = new BinanceMcpClient();
   let report: PaidReport | undefined;
@@ -180,9 +180,15 @@ async function runBuyerAgent(): Promise<void> {
     const briefing = typeof report.body === 'object' && report.body && 'briefing' in report.body
       ? `${(report.body as { briefing: unknown }).briefing}`
       : '';
-    if (!briefing) throw new Error('Paid seller response did not include a briefing');
+    if (!briefing) throw new Error('Seller response did not include a briefing');
     console.log(`\n${briefing}`);
-    console.log(`\n💳 Real x402 settlement receipt: ${report.paymentReceiptId}`);
+    if (report.accessMode === 'free') {
+      console.log('\n🆓 Free briefing access. No payment was requested.');
+    } else if (report.paymentReceiptId) {
+      console.log(`\n💳 Real x402 settlement receipt: ${report.paymentReceiptId}`);
+    } else {
+      throw new Error('Paid seller response did not include a real settlement receipt');
+    }
     const signal = parseTradingSignal(briefing);
     if (signal.action !== 'BUY_SMALL') {
       console.log(`\n🧭 SIGNAL402 SCREEN: WAIT`);
@@ -212,7 +218,9 @@ async function runBuyerAgent(): Promise<void> {
       return;
     }
     await executeApprovedTrade(mcp, proposalId, signal);
-    console.log('\n✅ Buyer workflow completed with real settlement and real Binance order data.');
+    console.log(report.accessMode === 'free'
+      ? '\n✅ Buyer workflow completed with free access and real Binance order data.'
+      : '\n✅ Buyer workflow completed with real settlement and real Binance order data.');
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`\n❌ Buyer workflow stopped: ${message}`);

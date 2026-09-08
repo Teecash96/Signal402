@@ -34,13 +34,15 @@ type SignResult = {
 
 export type PaidReport = {
   body: unknown;
-  paymentReceiptId: string;
-  paymentResponse: unknown;
+  paymentReceiptId?: string;
+  paymentResponse?: unknown;
+  accessMode: 'b402' | 'free';
 };
 
 export type ReportPaymentChallenge = {
   url: string;
-  paymentRequirements: string;
+  accessMode: 'b402' | 'free';
+  paymentRequirements?: string;
   body: unknown;
 };
 
@@ -119,9 +121,17 @@ export async function requestReportChallenge(endpoint: string, resourcePath = '/
   } catch (error: unknown) {
     throw new Error(`Seller challenge request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (challenge.status !== 402) throw new Error(`Expected real HTTP 402 from seller, received ${challenge.status}`);
+  if (challenge.status === 200
+    && challenge.data
+    && typeof challenge.data === 'object'
+    && (challenge.data as Record<string, unknown>).accessMode === 'free') {
+    await audit('free.resource.delivered', { url });
+    return { url, accessMode: 'free', body: challenge.data };
+  }
+  if (challenge.status !== 402) throw new Error(`Expected HTTP 402 or an explicitly enabled free report from seller, received ${challenge.status}`);
   return {
     url,
+    accessMode: 'b402',
     paymentRequirements: decodePaymentHeader(challenge),
     body: challenge.data,
   };
@@ -131,7 +141,11 @@ export async function payReportChallenge(
   challenge: ReportPaymentChallenge,
   options: { explicitlyApproved?: boolean } = {},
 ): Promise<PaidReport> {
+  if (challenge.accessMode === 'free') {
+    return { body: challenge.body, accessMode: 'free' };
+  }
   const paymentRequirements = challenge.paymentRequirements;
+  if (!paymentRequirements) throw new Error('Seller returned paid mode without payment requirements');
   const preview = await baw<Preview>(['x402-payment', 'preview', '--paymentRequirements', paymentRequirements, '--json']);
   const ready = preview.options.find((option) => option.status === 'READY_TO_SIGN'
     && option.tokenSymbol?.toUpperCase() === 'USDC'
@@ -153,7 +167,7 @@ export async function payReportChallenge(
   if (paid.status !== 200) throw new Error(`Seller rejected the signed x402 payment with HTTP ${paid.status}: ${JSON.stringify(paid.data)}`);
   const receipt = paymentReceiptId(paid.headers as Record<string, unknown>);
   await audit('x402.resource.delivered', { url: challenge.url, paymentReceiptId: receipt.id });
-  return { body: paid.data, paymentReceiptId: receipt.id, paymentResponse: receipt.raw };
+  return { body: paid.data, paymentReceiptId: receipt.id, paymentResponse: receipt.raw, accessMode: 'b402' };
 }
 
 export async function purchaseReport(
