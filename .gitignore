@@ -4,6 +4,8 @@ build/
 target/
 *.tsbuildinfo
 .out/
+coverage/
+.vercel/
 .env
 .env.local
 *.env.*
