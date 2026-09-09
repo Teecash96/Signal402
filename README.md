@@ -2,73 +2,196 @@
 
 [![CI](https://github.com/Teecash96/Signal402/actions/workflows/ci.yml/badge.svg)](https://github.com/Teecash96/Signal402/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-Signal402 is a real Binance Agent OS agent. A Seller Agent sells a live, evidence backed briefing through Binance B402 x402. A Buyer Agent pays with the Binance Agentic Wallet, reads its Agentic subaccount through a supported Binance MCP host, and can submit one real Spot `MARKET BUY` only after the risk gate, dashboard `APPROVE`, and final execution checks pass.
+Signal402 is a real Binance Agent OS agent. A Seller Agent provides a live, evidence backed briefing through a supported Binance MCP host. The Buyer reads its Agentic subaccount and can submit one real Spot `MARKET BUY` only after the risk gate, dashboard `APPROVE`, and final execution checks pass.
 
-There are no simulated payments, receipts, balances, fills, or order IDs.
+There are no simulated balances, fills, or order IDs.
 
 ## Problem
 
 Agents can read a price, but a price alone is not a trading decision. A useful agent workflow must also answer four questions:
 
 1. What evidence produced this recommendation?
-2. Did the buyer receive the exact report it paid for?
+2. Did the buyer receive the exact report it requested?
 3. Is the proposed order covered by the live account balance and risk rules?
 4. Did Binance actually accept and fill the order?
 
-Signal402 connects those answers into one auditable path. It sells a timestamped interpretation of live Binance data, gates the proposal with deterministic Spot and Futures rules, requires a human approval before every write, and records only payment and order evidence returned by Binance. It is a decision and execution control layer, not a profit promise.
+Signal402 connects those answers into one auditable path. It provides a timestamped interpretation of live Binance data, gates the proposal with deterministic Spot and Futures rules, requires a human approval before every write, and records only order evidence returned by Binance. It is a decision and execution control layer, not a profit promise.
+
+## Judges' 5 Minute Validation
+
+This validation follows the timed structure used by the [DeltaZero judge validation](https://github.com/Teecash96/DeltaZero/blob/main/README.md). The first two minutes prove the local product without exchange credentials. The live MCP steps require a supported host connected to the official Binance Agent OS server. Signal402 never replaces missing live evidence with fixtures.
+
+### Minute 1: Verify the local safety contract
+
+Run this from the repository root:
+
+```sh
+npm ci
+npm run validate:judge
+```
+
+Expected result:
+
+```text
+TypeScript build: pass
+Deterministic test suite: pass
+Dependency audit: pass
+Git whitespace check: pass
+```
+
+This proves the compiled contracts, deterministic risk rules, security tests, dependency state, and repository whitespace. It does not prove Binance OAuth, account funding, or a real fill.
+
+### Minute 2: Verify the Seller service
+
+In Terminal 1:
+
+```sh
+npm run start:seller
+```
+
+In Terminal 2:
+
+```sh
+curl -sS http://localhost:3001/api/health | jq
+curl -sS http://localhost:3001/api/report/info | jq
+```
+
+The response must show a healthy Seller and `ACCESS: FREE`.
+
+### Minute 3: Verify the agent contract
+
+Through a supported MCP host, call:
+
+```text
+signal402_get_capabilities
+signal402_get_workflow
+signal402_get_risk_state
+```
+
+Confirm that the response describes free access, the 10 USDT Spot cap, the Futures limits, human approval, no withdrawals, and the current persistent risk state. The host must discover Binance tool names at runtime. Signal402 does not accept invented names.
+
+### Minute 4: Verify live Binance context and briefing
+
+Through the same host, follow the returned workflow:
+
+```text
+signal402_publish_market
+signal402_request_briefing
+```
+
+The dashboard must show the real symbol, price, timestamp, source tool name, and `MCP: LIVE` only when those values came from the connected Binance MCP host. It must show `ACCESS: FREE`.
+
+If the host is not connected, the dashboard must remain `MCP: WAITING` or show the explicitly configured `MCP: FALLBACK` state. Neither state is live Binance evidence.
+
+### Minute 5: Verify the risk and approval boundary
+
+Call:
+
+```text
+signal402_assess_risk
+signal402_create_proposal
+signal402_wait_for_approval
+```
+
+The safe result is one of:
+
+* `WAIT`, which stops before proposal creation
+* `RISK GUARDIAN: refused`, which stops before any order call
+* An exact proposal waiting for dashboard `APPROVE`
+
+The optional live order path is separate. A funded account, dashboard `APPROVE`, and the existing confirmation rules are required. Only Binance returned order IDs, fills, events, and before and after balances may be shown as live evidence.
+
+### Evidence standard
+
+| Check | Proves | Does not prove |
+| --- | --- | --- |
+| `npm run validate:judge` | Build, tests, audit, and whitespace checks pass | Binance access or a real trade |
+| Seller health and report info | Local service and free access policy are configured | Binance access or a real trade |
+| `MCP: LIVE` | A supported host supplied a current Binance tool result | Profit or future price movement |
+| Free briefing | A current report was released | A successful trading strategy |
+| Risk decision | Deterministic rules accepted or refused the context | Guaranteed loss protection |
+| Order evidence | Binance returned the order and account change | A successful trading strategy |
+
+Never present a test fixture, a public REST fallback, or a planned order as live trading evidence.
 
 ## Architecture
 
-The supported MCP host owns Binance OAuth and runtime tool discovery. Signal402 owns the marketplace contract, B402 challenge handling, risk envelope, dashboard approval, and redacted audit trail.
+The supported MCP host owns Binance OAuth and runtime tool discovery. Signal402 owns the agent contract, free briefing access, risk envelope, dashboard approval, and redacted audit trail.
 
 ```mermaid
 flowchart LR
+  TRADER((Trader))
+
+  subgraph CLIENTS[Agent clients]
+    CLI[CLI agent]
+    MCPCLIENT[MCP client]
+    HTTP[HTTP client]
+  end
+
   subgraph HOST[Supported MCP host]
-    BUYER[Buyer agent]
-    WORKFLOW[Signal402 workflow tools]
+    WORKFLOW[Signal402 workflow]
+    DISCOVERY[Runtime tool discovery]
     OAUTH[Binance OAuth]
   end
 
-  subgraph SIGNAL[Signal402 stateful local service]
-    SELLER[Seller API]
-    GATE[Risk Guardian and Futures gate]
+  subgraph SERVICE[Signal402 stateful Seller]
+    CONTEXT[Live context intake]
+    SELLER[Briefing API]
+    ACCESS[Free access]
+    RISK[DeltaZero style Risk Guardian]
+    DECISION{WAIT, refused, or eligible}
+    MODE[Neutral and COIN M: report only]
+    PLAN[Hash bound proposal]
     DASH[Approval dashboard]
-    AUDIT[Append only audit log]
+    AUDIT[Redacted audit log]
   end
 
   BINANCE[(Binance Agent OS MCP)]
-  BAW[(Binance Agentic Wallet)]
-  B402[(Binance B402 API)]
-  HUMAN((Human))
 
-  BUYER --> WORKFLOW
+  TRADER --> CLI
+  TRADER --> MCPCLIENT
+  TRADER --> HTTP
+  CLI --> WORKFLOW
+  MCPCLIENT --> WORKFLOW
+  HTTP --> WORKFLOW
+  WORKFLOW --> DISCOVERY
   OAUTH <--> BINANCE
-  WORKFLOW -->|discover and call live tools| BINANCE
-  WORKFLOW -->|publish live market context| SELLER
-  SELLER -->|402 payment terms| WORKFLOW
-  WORKFLOW -->|human approves exact payment| BAW
-  BAW -->|signed payment| B402
-  B402 -->|verify and settle| SELLER
-  SELLER -->|briefing and evidence| WORKFLOW
-  WORKFLOW --> GATE
-  GATE -->|eligible proposal| DASH
-  HUMAN -->|APPROVE and CONFIRM| DASH
+  DISCOVERY --> BINANCE
+  WORKFLOW -->|publish live context| CONTEXT
+  BINANCE -->|market and account data| CONTEXT
+  CONTEXT --> SELLER
+  SELLER --> ACCESS
+  ACCESS --> RISK
+  RISK --> DECISION
+  DECISION -->|WAIT or refusal| AUDIT
+  DECISION --> MODE
+  MODE --> AUDIT
+  DECISION -->|eligible| PLAN
+  PLAN --> DASH
+  TRADER -->|APPROVE| DASH
   DASH --> WORKFLOW
-  WORKFLOW -->|one capped order| BINANCE
-  BINANCE -->|order, fill, account events| WORKFLOW
-  WORKFLOW -->|reconcile real evidence| SELLER
-  SELLER --> AUDIT
+  WORKFLOW -->|fresh check and one capped order| BINANCE
+  BINANCE -->|real order, fill, account events| WORKFLOW
+  WORKFLOW -->|reconcile verified evidence| AUDIT
+
+  classDef trader fill:#f4c95d,stroke:#f4c95d,color:#071018
+  classDef boundary fill:#0d1922,stroke:#5eead4,color:#edf5f3
+  classDef safety fill:#29151c,stroke:#fb7185,color:#ffe4e6
+  class TRADER trader
+  class CLIENTS,HOST,SERVICE,ACCESS,PLAN,DASH,AUDIT boundary
+  class MODE safety
 ```
+
+The full system and sequence diagrams are in [docs/architecture.md](./docs/architecture.md). The one minute trader focused capture plan is in [docs/demo-script.md](./docs/demo-script.md).
 
 ### Trust boundaries
 
 | Component | Responsibility | Never does |
 | --- | --- | --- |
 | Supported MCP host | Binance OAuth, runtime tool discovery, live account reads, and order calls | Invent tool names or use public REST for account data |
-| Signal402 Seller | Briefing access, payment verification, risk state, approval state, and audit records | Hold Binance OAuth tokens or issue fake payment and order evidence |
-| Binance Agentic Wallet | Signs an approved B402 payment | Approve a trade or place a Binance order |
+| Signal402 Seller | Free briefing access, risk state, approval state, and audit records | Hold Binance OAuth tokens or issue fake order evidence |
 | Browser dashboard | Shows state and records human approval | Receive API keys, OAuth tokens, or wallet credentials |
-| Binance | Source of truth for market, account, payment settlement, orders, and fills | Guarantee a risk estimate or a profit |
+| Binance | Source of truth for market, account, orders, and fills | Guarantee a risk estimate or a profit |
 
 ## Repository map
 
@@ -77,22 +200,20 @@ flowchart LR
 | [`src/agent/server.ts`](./src/agent/server.ts) | Signal402 MCP tools and the mandatory workflow |
 | [`src/seller/index.ts`](./src/seller/index.ts) | Stateful Seller API, dashboard, approval routes, and health check |
 | [`src/lib/binanceMcp.ts`](./src/lib/binanceMcp.ts) | Optional approved direct MCP client and encrypted token cache. Supported host mode remains the default |
-| [`src/lib/binanceX402.ts`](./src/lib/binanceX402.ts) | Real Binance B402 seller verification and settlement |
-| [`src/lib/binanceX402Client.ts`](./src/lib/binanceX402Client.ts) | Real Agentic Wallet x402 payment client |
 | [`src/lib/futuresRisk.ts`](./src/lib/futuresRisk.ts) | Pure deterministic DeltaZero based Futures risk envelope |
 | [`src/lib/executionPlan.ts`](./src/lib/executionPlan.ts) | Hash bound, 60 second, single use execution plans |
-| [`src/lib/executionReceipt.ts`](./src/lib/executionReceipt.ts) | Ordered hash verified payment and order evidence |
+| [`src/lib/executionReceipt.ts`](./src/lib/executionReceipt.ts) | Ordered hash verified order evidence |
 | [`src/lib/riskState.ts`](./src/lib/riskState.ts) | Persistent kill switch and equity drawdown state |
 | [`src/lib/carryEconomics.ts`](./src/lib/carryEconomics.ts) | Binance CEX Spot and Futures carry report, report only |
 | [`src/buyer/riskGuardian.ts`](./src/buyer/riskGuardian.ts) | Live USDT balance gate for Spot proposals |
 | [`.agents/skills/signal402-binance/`](./.agents/skills/signal402-binance/) | Reusable Agent Skills contract for real Binance operation |
-| [`test/`](./test/) | Deterministic risk, schema, security, payment, and fill proof tests |
+| [`test/`](./test/) | Deterministic risk, schema, security, and fill proof tests |
 | [`web/`](./web/) | Safe public Vercel front door with no account data |
 | [`SIGNAL402_AGENT.md`](./SIGNAL402_AGENT.md) | Host contract and exact tool sequence |
 
-## What the buyer pays for
+## What the buyer receives
 
-Signal402 does not sell a raw ticker wrapper. It sells a verified market intelligence artifact for a requested symbol. After real B402 settlement, the Seller returns the live Binance snapshot plus an explainable screening result:
+Signal402 does not expose a raw ticker wrapper. It returns a verified market intelligence artifact for a requested symbol. The Seller returns the live Binance snapshot plus an explainable screening result:
 
 1. Direction from the 24 hour move.
 2. Risk tier from momentum and the observed 24 hour range.
@@ -100,7 +221,7 @@ Signal402 does not sell a raw ticker wrapper. It sells a verified market intelli
 4. A deterministic `BUY_SMALL` or `WAIT` action.
 5. The thesis and the rule that invalidates the result.
 
-The action is not a profit promise. `BUY_SMALL` only permits the next safety checks. `WAIT` blocks proposal creation. The Buyer still reads the live Agentic subaccount, applies Risk Guardian, and waits for dashboard approval. This is the reason for the 0.01 USDC payment: the Buyer pays for an independently produced, timestamped interpretation rather than free price access.
+The action is not a profit promise. `BUY_SMALL` only permits the next safety checks. `WAIT` blocks proposal creation. The Buyer still reads the live Agentic subaccount, applies Risk Guardian, and waits for dashboard approval. The artifact is an independently produced, timestamped interpretation rather than a raw price feed.
 
 The screening rules are visible and deterministic. A move of at least 1 percent is bullish, a move of at most negative 1 percent is bearish, and high risk starts at an absolute move of 8 percent or a 24 hour range of 12 percent. Only bullish, non high risk snapshots produce `BUY_SMALL`.
 
@@ -108,19 +229,19 @@ Signal402 also publishes a Binance CEX carry report when the host supplies both 
 
 ## Public frontend and live console
 
-The repository includes a small public Vercel front door in [`web/`](./web/). It explains the workflow and its hard boundaries without exposing credentials, balances, payment data, or fake market values. The live operator console is the Express app at `http://localhost:3001` because its authenticated approval state, Binance OAuth host connection, and audit trail must remain on a stateful agent host. A Vercel static deployment is therefore a product entry point, not a claim that Vercel is executing trades.
+The repository includes a small public Vercel front door in [`web/`](./web/). It explains the workflow and its hard boundaries without exposing credentials, balances, or fake market values. The live operator console is the Express app at `http://localhost:3001` because its authenticated approval state, Binance OAuth host connection, and audit trail must remain on a stateful agent host. A Vercel static deployment is therefore a product entry point, not a claim that Vercel is executing trades.
 
-Open the deployed public front door at [signal402-three.vercel.app](https://signal402-three.vercel.app/). It is intentionally informational. Do not enter Binance credentials or payment secrets into it.
+Open the deployed public front door at [signal402-three.vercel.app](https://signal402-three.vercel.app/). It is intentionally informational. Do not enter Binance credentials into it.
 
 The local console uses a compact execution control room layout. It keeps MCP state, data source, access mode, risk status, approval, order evidence, and the Futures event trail visible. A `MCP: FALLBACK` label means the optional public REST source is active. It never means that Binance account or order data came from the fallback.
 
-## Temporary free access
+## Free agent access
 
-If B402 merchant onboarding is not available yet, set `SIGNAL402_FREE_ACCESS=true` in `.env`. The Seller then returns the live briefing without requesting payment. The response has no receipt and the dashboard shows `ACCESS: FREE`. This mode does not create a fake receipt and does not weaken live Binance MCP data, Risk Guardian, dashboard approval, the 10 USDT order cap, or audit logging. Paid B402 mode remains the default. Never describe a free briefing as a settled B402 payment.
+Signal402 provides free access. MCP, CLI, and HTTP agents can request the live briefing directly. Free access is not read only. Agents can publish live MCP context, run the risk gates, create proposals, and request real Binance orders when the dashboard approval, confirmation, account, and safety rules pass. The dashboard shows `ACCESS: FREE`. This mode does not weaken live Binance MCP data, Risk Guardian, dashboard approval, the 10 USDT order cap, Futures limits, or audit logging.
 
 ## Run with your own account
 
-The Binance MCP account and the B402 wallet are different Binance products. The Spot order uses the Binance Agentic subaccount. The x402 payment uses the Binance Agentic Wallet on BSC. Fund both with small amounts before using production funds.
+The Spot order uses the Binance Agentic subaccount. Fund it with a small amount before using production funds.
 
 ### Preflight
 
@@ -132,10 +253,7 @@ The Binance MCP account and the B402 wallet are different Binance products. The 
 | Seller | Running locally with a long random `SIGNAL402_HOST_TOKEN` |
 | Dashboard | Password hash and session secret configured |
 | Spot funds | Agentic subaccount has enough USDT for the capped order and fees |
-| Paid access | B402 merchant credentials and Agentic Wallet CLI configured |
-| Free access | `SIGNAL402_FREE_ACCESS=true` only when B402 onboarding is unavailable |
-
-The free path is useful for validating live MCP data and the risk gate. It is not evidence of a settled B402 payment. Use paid mode for marketplace settlement evidence.
+| Access | Always free. No credentials beyond the supported Binance host are required |
 
 1. Clone and install.
 
@@ -162,11 +280,7 @@ The free path is useful for validating live MCP data and the risk gate. It is no
 
    Copy the printed `SIGNAL402_DASHBOARD_PASSWORD_HASH` line into `.env`. The helper prints shell quotes around the scrypt value so its `$` separators stay intact. Set `SIGNAL402_DASHBOARD_SESSION_SECRET` and `MCP_TOKEN_ENCRYPTION_KEY` to separate random values. The dashboard approval route has a server side session, secure cookie settings, a five failure login limit, and a honeypot. Set the optional Cloudflare Turnstile keys to add challenge verification. Do not run `source .env`; the application loads `.env` itself.
 
-4. Apply for Binance B402 merchant credentials. Binance provides the production base URL, `clientId`, and `accessToken` after onboarding. Generate the RSA key pair locally, submit only the public key, keep the private key locally, and set a seller BSC address in `B402_PAY_TO`. This repository refuses to issue a fake challenge when these values are missing. If onboarding is unavailable, use the temporary free access mode above.
-
-5. For paid mode, install and log in to the Binance Agentic Wallet CLI. The executable must be available as `baw`, or set `BINANCE_AGENTIC_WALLET_BIN` to its path. The payment tool uses the documented `baw x402-payment preview` and `baw x402-payment sign` commands. You can skip this step while temporary free access is enabled.
-
-6. Start the Seller.
+4. Start the Seller.
 
    ```sh
    npm run start:seller
@@ -174,7 +288,7 @@ The free path is useful for validating live MCP data and the risk gate. It is no
 
    The Seller does not authenticate to Binance in host mode. The supported MCP host performs Binance login and asks for Market data, Account, and Trade scopes for the Agentic subaccount. Do not grant a transfer scope. Binance Agent OS does not provide a withdrawal scope.
 
-7. Add two MCP servers to a supported host such as Codex Desktop, Codex CLI, Claude, Cursor, or ChatGPT. Binance owns the OAuth flow. Signal402 does not open a custom OAuth page or store Binance tokens.
+5. Add two MCP servers to a supported host such as Codex Desktop, Codex CLI, Claude, Cursor, or ChatGPT. Binance owns the OAuth flow. Signal402 does not open a custom OAuth page or store Binance tokens.
 
    Binance MCP:
 
@@ -190,11 +304,11 @@ The free path is useful for validating live MCP data and the risk gate. It is no
 
    In supported host mode, the MCP host is the Buyer. Do not also run `npm run start:buyer`; that legacy standalone process is not part of the host workflow.
 
-8. Open [http://localhost:3001](http://localhost:3001). Sign in with the dashboard password. The header must show `MCP: LIVE` after the host publishes a live ticker. `DATA: FALLBACK` is allowed only when `ALLOW_PUBLIC_REST_FALLBACK=true` and is clearly labelled.
+6. Open [http://localhost:3001](http://localhost:3001). Sign in with the dashboard password. The header must show `MCP: LIVE` after the host publishes a live ticker. `DATA: FALLBACK` is allowed only when `ALLOW_PUBLIC_REST_FALLBACK=true` and is clearly labelled.
 
-9. Fund the Agentic subaccount with USDT using the Binance web UI. The documented path is Profile, Dashboard, Subaccount, Asset Management, Transfer. Keep at least 10 USDT available for the capped Spot order.
+7. Fund the Agentic subaccount with USDT using the Binance web UI. The documented path is Profile, Dashboard, Subaccount, Asset Management, Transfer. Keep at least 10 USDT available for the capped Spot order.
 
-10. In the supported host, call `signal402_get_workflow` and follow the returned workflow. The host discovers Binance tool names at runtime, publishes the live market snapshot, pays the real 0.01 USDC challenge after human confirmation in paid mode, or continues without payment in free mode. It stops when the Seller returns `WAIT`, or creates the proposal when the Seller returns `BUY_SMALL`. It then waits for the dashboard `APPROVE`, submits one real MARKET BUY capped at 10 USDT, reads the real fill and balances, and records the receipt only in paid mode.
+8. In the supported host, call `signal402_get_workflow` and follow the returned workflow. The host discovers Binance tool names at runtime, publishes the live market snapshot, requests the free briefing, and stops when the Seller returns `WAIT` or creates the proposal when the Seller returns `BUY_SMALL`. It then waits for the dashboard `APPROVE`, submits one real MARKET BUY capped at 10 USDT, reads the real fill and balances, and records the Binance evidence.
 
 The full agent contract is in [`SIGNAL402_AGENT.md`](./SIGNAL402_AGENT.md). Load it in the supported host before enabling trading.
 
@@ -218,7 +332,7 @@ The Futures risk envelope is deterministic and versioned. It records the input h
 
 The host sends funding as `fundingRateBps`, in basis points for one funding interval. It also sends `nextFundingTime`. Signal402 does not convert an unknown unit or guess a missing interval. After dashboard approval, the host must re-read the account and market data and call `signal402_revalidate_futures_context`; a stale or changed context cancels the execution path.
 
-Signal402 requires isolated margin and reads the existing leverage. It never changes leverage, margin mode, or position mode automatically. Futures orders use an explicit symbol, side, position side, quantity, and `reduceOnly` value. `quoteOrderQty` is never sent. Every directional USD M order needs dashboard `APPROVE` and a separate `CONFIRM` step. The host then submits one live MARKET order through its runtime discovered Binance Futures MCP tool and records authenticated order and account events. The dashboard shows the receipt, order ID, fill, position, margin, and event timeline only when those values came from Binance.
+Signal402 requires isolated margin and reads the existing leverage. It never changes leverage, margin mode, or position mode automatically. Futures orders use an explicit symbol, side, position side, quantity, and `reduceOnly` value. `quoteOrderQty` is never sent. Every directional USD M order needs dashboard `APPROVE` and a separate `CONFIRM` step. The host then submits one live MARKET order through its runtime discovered Binance Futures MCP tool and records authenticated order and account events. The dashboard shows the order ID, fill, position, margin, and event timeline only when those values came from Binance.
 
 The risk envelope is a risk estimate, not a guaranteed loss limit. Liquidation, fees, funding changes, latency, and exchange execution can produce a different result. Keep the Agentic Futures wallet funded only with an amount you can lose, and use Binance's emergency stop if needed.
 
@@ -226,38 +340,15 @@ The implementation follows the [Binance Agent OS agentic MCP documentation](http
 
 ## Supported host architecture
 
-Binance Agent OS currently authorizes approved AI hosts. Signal402 therefore runs as a local MCP server beside the official Binance MCP server. The host owns Binance OAuth and calls both servers. Signal402 owns the marketplace state, x402 payment flow, Risk Guardian, dashboard approval gate, and append only audit log.
+Binance Agent OS currently authorizes approved AI hosts. Signal402 therefore runs as a local MCP server beside the official Binance MCP server. The host owns Binance OAuth and calls both servers. Signal402 owns the briefing state, Risk Guardian, dashboard approval gate, and append only audit log.
 
-The host bridge accepts only live market data and fill records that identify their Binance MCP source. When publishing Spot data, pass the complete runtime discovered Binance tool list, including the balance and order tools that may be used after approval. It rejects missing runtime tool names, invalid balances, missing order fields, fills before dashboard approval, and amounts above the hard 10 USDT cap. Signal402 never accepts a simulated receipt.
+The host bridge accepts only live market data and fill records that identify their Binance MCP source. When publishing Spot data, pass the complete runtime discovered Binance tool list, including the balance and order tools that may be used after approval. It rejects missing runtime tool names, invalid balances, missing order fields, fills before dashboard approval, and amounts above the hard 10 USDT cap. Signal402 never accepts simulated order evidence.
 
-Every eligible proposal also receives a 60 second execution plan. The plan binds the exact symbol, side, quantity, notional, position side, reduce only value, existing leverage, margin mode, source hashes, payment receipt, and expiry. A plan can be approved once and consumed once. A changed or stale plan is refused. A reconciled live order produces an ordered execution receipt with the plan hash, real Binance MCP tool name, order ID, fill values, before and after account state, and a SHA 256 proof hash.
+Every eligible proposal also receives a 60 second execution plan. The plan binds the exact symbol, side, quantity, notional, position side, reduce only value, existing leverage, margin mode, source hashes, and expiry. A plan can be approved once and consumed once. A changed or stale plan is refused. A reconciled live order produces an ordered execution record with the plan hash, real Binance MCP tool name, order ID, fill values, before and after account state, and a SHA 256 proof hash.
 
 The dashboard exposes a persistent risk control. An operator can enable the kill switch, and the host can publish live equity. A two percent drawdown shows a warning. A three percent drawdown halts new proposals. The state is written atomically to `state/signal402-risk.json`, which is ignored by Git. Clearing a kill switch never cancels an existing Binance order. A drawdown halt can be reset only from the authenticated dashboard after the recovery check and a typed `RESET_HALT` confirmation.
 
 The older direct `BinanceMcpClient` remains only as an isolated path for a future Binance approved client. It is not the default and must not be used to bypass the supported host flow.
-
-## Real Binance x402 flow implemented here
-
-The Seller calls the authenticated Binance B402 v2 API. The paths are:
-
-```text
-POST {B402_BASE_URL}/papi/v2/b402/supported
-POST {B402_BASE_URL}/papi/v2/b402/verify
-POST {B402_BASE_URL}/papi/v2/b402/settle
-```
-
-Each request is signed with RSA SHA256 over the exact JSON body concatenated with the millisecond timestamp. The required headers are `Content-Type`, `X-Tesla-ClientId`, `X-Tesla-SignAccessToken`, `X-Tesla-Signature`, and `X-Tesla-Timestamp`.
-
-The Seller caches `/supported`, copies the complete `extra` object into a v2 `PaymentRequirements` entry, and returns HTTP 402 with a Base64 `PAYMENT-REQUIRED` header. It also sends the documented `X-PAYMENT-REQUIREMENTS` compatibility header. The body contains `x402Version: 2`, `resource`, and `accepts`. The selected requirement is exact USDC on BSC for 0.01 USDC, with the amount represented in atomic units.
-
-The Buyer passes the 402 requirement to:
-
-```text
-baw x402-payment preview --paymentRequirements <base64-or-json> --json
-baw x402-payment sign --paymentId <id> --selectedIndex <index> --json
-```
-
-The signed response supplies a `PAYMENT-SIGNATURE` header. The Buyer replays the request with that header. B402 verifies, settles, and returns `PAYMENT-RESPONSE`, whose Base64 JSON contains the settlement transaction hash. The Seller delivers the briefing only after `/verify` is valid and `/settle` returns success with a valid 32 byte transaction hash. A pending transaction with a nonempty hash is polled through the idempotent `/settle` endpoint for up to 30 minutes. A failed or unsigned payment never produces a briefing.
 
 ## Safety model
 
@@ -266,7 +357,6 @@ The safety model is enforced in server code and strict schemas. It is not only a
 | Gate | Enforcement |
 | --- | --- |
 | Account access | Binance OAuth stays in the supported MCP host. Signal402 never receives the host token. |
-| Payment | Paid mode releases a briefing only after B402 verification and settlement return a real receipt. Free mode has no receipt and is labelled free. |
 | Spot size | One `MARKET BUY` only. The quote amount is capped at 10 USDT. |
 | Balance | The host reads USDT before proposal and again before the order. A balance below the proposed amount refuses the trade. |
 | Human control | Every write needs dashboard `APPROVE`. Futures also needs `CONFIRM` for the exact order fields. |
@@ -286,21 +376,21 @@ For a refusal test, use a real account with less than the proposed amount. Do no
 
 Secrets stay in environment variables or the Binance host. The browser receives no API key, access token, private key, or wallet credential. If the approved direct client is used, its OAuth token state is encrypted with AES 256 GCM in `.mcp-tokens.json` and the file is ignored with mode `0600`. The local audit log is redacted by default and can encrypt its details with `SIGNAL402_AUDIT_ENCRYPTION_KEY`; production should set `SIGNAL402_REQUIRE_AUDIT_ENCRYPTION=true`.
 
-The Seller sends security headers, limits JSON bodies to 32 KB, restricts CORS to `SIGNAL402_ALLOWED_ORIGINS`, rejects unknown fields with Zod schemas, and returns trimmed state without raw MCP payloads. Dashboard state and approval require the dashboard session. Host market, proposal, status, and state writes require the bridge token. Trade status cannot be changed by editing a client field: the server checks the payment receipt, configured symbol, ten USDT cap, approval state, runtime MCP tool name, order fields, and before and after balance changes.
+The Seller sends security headers, limits JSON bodies to 32 KB, restricts CORS to `SIGNAL402_ALLOWED_ORIGINS`, rejects unknown fields with Zod schemas, and returns trimmed state without raw MCP payloads. Dashboard state and approval require the dashboard session. Host market, proposal, status, and state writes require the bridge token. Trade status cannot be changed by editing a client field: the server checks the configured symbol, ten USDT cap, approval state, runtime MCP tool name, order fields, and before and after balance changes.
 
 Set `SIGNAL402_FORCE_HTTPS=true`, `SIGNAL402_COOKIE_SECURE=true`, and `SIGNAL402_TRUST_PROXY=true` only when a trusted TLS reverse proxy is in front of the Seller. Run `npm audit` before deployment. Signal402 has no database, SQL query layer, password table, or file upload endpoint, so public database keys, row level security, query parameterization, and upload validation are not applicable until those components are added.
 
 ## Evidence standard
 
-Local tests prove deterministic rules and rejection paths. They do not prove Binance OAuth, B402 settlement, account funding, or a real fill. Live acceptance requires all of the following to be visible in the audit trail and dashboard:
+Local tests prove deterministic rules and rejection paths. They do not prove Binance OAuth, account funding, or a real fill. Live acceptance requires all of the following to be visible in the audit trail and dashboard:
 
 1. A live Binance MCP tool name and timestamped market or Futures context.
-2. A real B402 receipt in paid mode, or an explicit free access state.
+2. An explicit free access state.
 3. The risk envelope and the exact proposal fields.
 4. Human dashboard approval and, for Futures, typed `CONFIRM`.
 5. A real Binance order ID, fill, event, and before and after balance or position snapshots.
 
-Never present a test fixture, a free briefing, or a public REST price as live payment or trading evidence.
+Never present a test fixture or a public REST price as live Binance trading evidence.
 
 ### Local release checks
 
@@ -315,4 +405,4 @@ git diff --check
 
 ## Configuration
 
-See [`.env.example`](./.env.example). Keep `.env`, `.mcp-tokens.json`, RSA keys, wallet credentials, and audit logs out of Git. Start with Binance B402 Sandbox where available. Production B402 access requires Binance partner onboarding and IP whitelisting.
+See [`.env.example`](./.env.example). Keep `.env`, `.mcp-tokens.json`, and audit logs out of Git. Use the supported Binance MCP host for live account access.

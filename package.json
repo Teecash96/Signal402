@@ -1,7 +1,7 @@
 {
   "name": "signal402",
   "version": "1.0.0",
-  "description": "An agent-to-agent verified market-intelligence service on Binance Agent OS: AI agents pay for explainable Binance Spot and Futures briefings settled via Binance x402, with human-confirmed, risk-gated trading through runtime discovered Binance MCP tools.",
+  "description": "A free agent-to-agent market-intelligence service on Binance Agent OS: MCP, CLI, and HTTP agents can read explainable Binance Spot and Futures briefings and request human-approved, risk-gated trading through runtime discovered Binance MCP tools. Optional Binance x402 settlement is supported.",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "start:buyer": "npx tsx src/buyer/index.ts",
     "start:signal402-agent": "npx tsx src/agent/server.ts",
     "hash:dashboard-password": "node scripts/hash-dashboard-password.mjs",
+    "validate:judge": "node scripts/judge-validation.mjs",
     "dev:seller": "npx tsx watch src/seller/index.ts",
     "dev:buyer": "npx tsx watch src/buyer/index.ts",
     "test": "node --import tsx --test test/**/*.test.ts"

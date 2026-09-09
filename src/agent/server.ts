@@ -69,7 +69,7 @@ Signal402 is a real Binance Agent OS workflow. The supported MCP host owns Binan
 1. Discover the currently available Binance MCP tools at runtime. Do not invent or hardcode tool names.
 2. Call the Binance MCP market data tool for the requested symbol. Do not use public REST for account or trading data.
 3. Call signal402_publish_market with the live MCP result and the complete list of runtime discovered Binance tool names, not only the ticker tool. Signal402 derives an explainable direction, risk tier, and BUY_SMALL or WAIT action from that snapshot.
-4. Call signal402_request_briefing to inspect the access mode. In paid mode, verify that the real B402 amount is 0.01 USDC and that the merchant terms are expected. In free mode, no payment is requested and no receipt exists.
+4. Call signal402_request_briefing to inspect the access mode. Free mode is the default, so no payment is requested and no receipt exists. If the Seller is explicitly configured for B402, verify the real 0.01 USDC amount and merchant terms before continuing.
 5. In paid mode, ask the human to approve that exact payment. Only then call signal402_pay_briefing with confirmPayment=true. In free mode, call signal402_pay_briefing only if you need the report body, and never invent or attach a receipt.
 6. Call the Binance MCP account balance tool. Pass the live USDT balance to signal402_create_proposal.
 7. If the Seller returns WAIT or a refused proposal, stop. Do not create an order. Otherwise wait for the human to press APPROVE in the Signal402 dashboard by calling signal402_wait_for_approval.
@@ -81,7 +81,7 @@ Futures branch, opt in with an explicit USD_M or COIN_M context:
 1. Discover runtime Futures tools and reject tools that are not clearly marked Futures, USD M, COIN M, perpetual, derivative, or contract tools.
 2. Read mark price, bid and ask, depth, funding and next funding time, exchange filters, leverage brackets, account margin, positions, open orders, and liquidation data. Publish them with signal402_publish_futures_context.
 3. Run signal402_assess_futures_risk. The deterministic envelope fails closed on stale data, cross margin, leverage above 3x, a combined notional above 10 USDT, missing data, excessive spread, slippage, funding stress, or liquidation risk.
-4. Pay the real 0.01 USDC B402 challenge only after human payment approval. A settled receipt is required before the paid Futures report is released.
+4. If B402 mode is explicitly enabled, pay the real 0.01 USDC challenge only after human payment approval. A settled receipt is required before the paid Futures report is released. In the default free mode, no payment or receipt is used.
 5. Neutral and COIN M paths stop at a report. They never show an approval button and never submit an order.
 6. Directional USD_M can create a proposal only when executionEligible=true and a supported protective stop plan is declared. Wait for dashboard APPROVE, then ask the human to type CONFIRM for the exact order.
 7. Re-read the account and Futures context, then call signal402_revalidate_futures_context. Submit one MARKET order through the live runtime USD_M Futures MCP tool with symbol, side, explicit positionSide, quantity, reduceOnly, existing leverage at or below 3x, and isolated margin. Never send quoteOrderQty. Never change leverage or margin mode automatically.

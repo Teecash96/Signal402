@@ -2,7 +2,18 @@ export type ReportAccessMode = 'b402' | 'free';
 export type ReportAccessStatus = 'waiting' | 'settled' | 'free' | 'error';
 
 export function reportAccessMode(env: NodeJS.ProcessEnv = process.env): ReportAccessMode {
-  return env.SIGNAL402_FREE_ACCESS?.trim().toLowerCase() === 'true' ? 'free' : 'b402';
+  const configuredMode = env.SIGNAL402_ACCESS_MODE?.trim().toLowerCase();
+  if (configuredMode === 'free') return 'free';
+  if (configuredMode === 'b402' || configuredMode === 'paid') return 'b402';
+  if (configuredMode) throw new Error('SIGNAL402_ACCESS_MODE must be "free" or "b402"');
+
+  // Keep the old flag working for existing deployments. A missing setting is
+  // intentionally free so MCP, CLI, and HTTP agents can use Signal402 without
+  // merchant onboarding. Paid B402 access is an explicit opt in.
+  const legacyFree = env.SIGNAL402_FREE_ACCESS?.trim().toLowerCase();
+  if (legacyFree === 'true') return 'free';
+  if (legacyFree === 'false') return 'b402';
+  return 'free';
 }
 
 /**

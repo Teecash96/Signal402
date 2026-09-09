@@ -5,6 +5,7 @@ import { audit } from '../lib/audit.js';
 import { validateSellerEndpoint } from '../lib/endpointSecurity.js';
 import { BinanceMcpClient, extractUsdtBalance, type BinanceBalance, type BinanceOrder } from '../lib/binanceMcp.js';
 import { purchaseReport, type PaidReport } from '../lib/binanceX402Client.js';
+import { reportAccessMode } from '../lib/reportAccess.js';
 import { assessLiveTradeRisk, type RiskAssessment } from './riskGuardian.js';
 
 const SELLER_ENDPOINT = process.env.SELLER_ENDPOINT_URL ?? 'http://localhost:3001';
@@ -15,6 +16,7 @@ const MAX_TRADE_SIZE_USDT = Number.isFinite(configuredMax) ? Math.min(configured
 const APPROVAL_TIMEOUT_MS = Number.parseInt(process.env.APPROVAL_TIMEOUT_MS ?? '300000', 10);
 const APPROVAL_POLL_MS = Number.parseInt(process.env.APPROVAL_POLL_MS ?? '1000', 10);
 const HOST_TOKEN = process.env.SIGNAL402_HOST_TOKEN ?? '';
+const ACCESS_MODE = reportAccessMode();
 
 function sellerAuthConfig(): { headers: { Authorization: string } } {
   return { headers: { Authorization: `Bearer ${HOST_TOKEN}` } };
@@ -177,7 +179,7 @@ async function runBuyerAgent(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  console.log(`\nSIGNAL402 BUYER AGENT\n${process.env.SIGNAL402_FREE_ACCESS === 'true' ? 'Free briefing, real MCP account reads, real Spot order after dashboard approval.' : 'Real Binance payment, real MCP account reads, real Spot order after dashboard approval.'}\nOrder cap: ${MAX_TRADE_SIZE_USDT.toFixed(2)} USDT\n`);
+  console.log(`\nSIGNAL402 BUYER AGENT\n${ACCESS_MODE === 'free' ? 'Free briefing, real MCP account reads, real Spot order after dashboard approval.' : 'Real Binance payment, real MCP account reads, real Spot order after dashboard approval.'}\nOrder cap: ${MAX_TRADE_SIZE_USDT.toFixed(2)} USDT\n`);
   if (configuredMax > 10) console.log('MAX_TRADE_SIZE_USDT was above the hard 10 USDT safety cap. It was reduced to 10 USDT.');
   const mcp = new BinanceMcpClient();
   let report: PaidReport | undefined;

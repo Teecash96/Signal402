@@ -1,18 +1,18 @@
 ---
 name: signal402-binance
-description: Operate Signal402 as a real Binance Agent OS decision and execution layer. Use runtime discovered Binance MCP tools, B402 access, deterministic risk gates, human approval, single use execution plans, and hash verified receipts. Never simulate balances, fills, receipts, or order IDs.
+description: Operate Signal402 as a real Binance Agent OS decision and execution layer. Free access is the default and B402 is optional. Use runtime discovered Binance MCP tools, deterministic risk gates, human approval, single use execution plans, and hash verified receipts. Never simulate balances, fills, receipts, or order IDs.
 ---
 
 # Signal402 Binance CEX skill
 
-Signal402 is a Binance CEX service for agents that need explainable market intelligence and guarded execution. The supported Binance MCP host owns OAuth. Signal402 owns the decision contract, payment boundary, risk gate, approval state, and evidence record.
+Signal402 is a Binance CEX service for agents that need explainable market intelligence and guarded execution. Free MCP, CLI, and HTTP access is the default. The supported Binance MCP host owns OAuth. Signal402 owns the decision contract, optional payment boundary, risk gate, approval state, and evidence record.
 
 ## Required route
 
 1. Read `signal402_get_capabilities` and `signal402_get_risk_state`.
 2. Discover Binance MCP tools at runtime. Never invent a tool name.
 3. Read live market and account data. Publish it with `signal402_publish_market` or `signal402_publish_futures_context`.
-4. Request the briefing. In paid mode inspect the exact B402 terms and ask the human to approve the payment before `signal402_pay_briefing`.
+4. Request the briefing. Free mode returns it without payment. If B402 mode is explicitly enabled, inspect the exact terms and ask the human to approve the payment before `signal402_pay_briefing`.
 5. Run the Spot or Futures risk gate. Stop on `WAIT`, a refusal, a stale plan, or a blocked risk state.
 6. Create the exact proposal. Keep the returned execution plan and plan hash.
 7. Wait for the dashboard `APPROVE` action. Approval is not an order.

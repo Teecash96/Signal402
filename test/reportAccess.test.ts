@@ -5,6 +5,9 @@ import { hasCurrentReportAccess, reportAccessMode } from '../src/lib/reportAcces
 import { tradeProposalInputSchema } from '../src/lib/schemas.js';
 
 test('free mode requires a current free briefing and no receipt', () => {
+  assert.equal(reportAccessMode({}), 'free');
+  assert.equal(reportAccessMode({ SIGNAL402_ACCESS_MODE: 'free' }), 'free');
+  assert.equal(reportAccessMode({ SIGNAL402_ACCESS_MODE: 'free', SIGNAL402_FREE_ACCESS: 'false' }), 'free');
   assert.equal(reportAccessMode({ SIGNAL402_FREE_ACCESS: 'true' }), 'free');
   assert.equal(hasCurrentReportAccess({ mode: 'free', status: 'free' }), true);
   assert.equal(hasCurrentReportAccess({ mode: 'free', status: 'waiting' }), false);
@@ -13,6 +16,8 @@ test('free mode requires a current free briefing and no receipt', () => {
 
 test('paid mode still requires the exact settlement receipt', () => {
   const receipt = `0x${'a'.repeat(64)}`;
+  assert.equal(reportAccessMode({ SIGNAL402_ACCESS_MODE: 'b402' }), 'b402');
+  assert.equal(reportAccessMode({ SIGNAL402_ACCESS_MODE: 'paid' }), 'b402');
   assert.equal(reportAccessMode({ SIGNAL402_FREE_ACCESS: 'false' }), 'b402');
   assert.equal(hasCurrentReportAccess({ mode: 'b402', status: 'settled', currentReceipt: receipt, providedReceipt: receipt }), true);
   assert.equal(hasCurrentReportAccess({ mode: 'b402', status: 'settled', currentReceipt: receipt }), false);

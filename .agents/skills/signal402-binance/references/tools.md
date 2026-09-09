@@ -25,6 +25,12 @@ The Signal402 MCP server exposes stable Signal402 tools. Binance tool names are 
 * `signal402_revalidate_futures_context`
 * `signal402_confirm_futures_execution`
 
+Free access is the default. In free mode, `signal402_request_briefing` and
+`signal402_pay_briefing` return the live report without signing a payment and
+with `paymentReceiptId: null`. Proposal and order tools remain available when
+their live account, approval, and risk gates pass. B402 is used only when the
+server is explicitly configured with `SIGNAL402_ACCESS_MODE=b402`.
+
 ## Evidence tools
 
 * `signal402_record_fill`
