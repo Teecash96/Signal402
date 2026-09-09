@@ -54,9 +54,10 @@ In Terminal 2:
 ```sh
 curl -sS http://localhost:3001/api/health | jq
 curl -sS http://localhost:3001/api/report/info | jq
+curl -sS http://localhost:3001/api/judge/status | jq
 ```
 
-The response must show a healthy Seller and `ACCESS: FREE`.
+The response must show a healthy Seller, `ACCESS: FREE`, and a truthful local validation state. `readyForLiveMcpDemo` stays false until the local checks pass and fresh MCP context arrives.
 
 ### Minute 3: Verify the agent contract
 
@@ -183,6 +184,16 @@ flowchart LR
 ```
 
 The full system and sequence diagrams are in [docs/architecture.md](./docs/architecture.md). The one minute trader focused capture plan is in [docs/demo-script.md](./docs/demo-script.md).
+
+### Judge facing improvements
+
+Signal402 now makes the important proof visible instead of hiding it in terminal output:
+
+1. The runtime MCP tool ledger shows the exact tool names supplied by the supported host, without exposing OAuth tokens or raw payloads.
+2. The freshness guard shows the market timestamp and age, refuses stale Spot proposals after 15 seconds, and labels every non MCP source.
+3. The Risk Guardian card shows a gate trace for signal, live balance coverage, data freshness, and the 10 USDT Spot cap.
+4. The read only market watch lets a judge compare an allowlisted set of Binance pairs through public REST without changing the tradable pair or enabling writes.
+5. The Judge Readiness panel reads the local `validate:judge` report and the live MCP state. It never turns missing evidence into a green status.
 
 ### Trust boundaries
 

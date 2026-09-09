@@ -3,7 +3,9 @@ import 'dotenv/config';
 import axios from 'axios';
 import cors from 'cors';
 import { timingSafeEqual } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import { resolve } from 'node:path';
 import { z } from 'zod';
 import { audit } from '../lib/audit.js';
 import { DashboardAuth, dashboardLoginSchema } from '../lib/auth.js';
@@ -65,6 +67,17 @@ import {
 const PORT = Number.parseInt(process.env.SELLER_PORT ?? '3001', 10);
 const SYMBOL = (process.env.TRADE_SYMBOL ?? 'BNBUSDT').toUpperCase();
 const FUTURES_SYMBOL = (process.env.FUTURES_SYMBOL ?? 'BTCUSDT').toUpperCase();
+const MARKET_WATCH_SYMBOLS = Array.from(new Set([
+  SYMBOL,
+  'BNBUSDT',
+  'BTCUSDT',
+  'ETHUSDT',
+  'SOLUSDT',
+  'XRPUSDT',
+  'ADAUSDT',
+  'DOGEUSDT',
+])).filter((symbol) => /^[A-Z0-9]{5,20}$/.test(symbol));
+const JUDGE_VALIDATION_FILE = resolve(process.cwd(), 'state', 'judge-validation.json');
 const PUBLIC_BASE_URL = process.env.PUBLIC_SELLER_URL ?? `http://localhost:${PORT}`;
 const TURNSTILE_SITE_KEY = process.env.SIGNAL402_TURNSTILE_SITE_KEY ?? '';
 if (TURNSTILE_SITE_KEY && !/^[A-Za-z0-9_-]{10,200}$/.test(TURNSTILE_SITE_KEY)) throw new Error('SIGNAL402_TURNSTILE_SITE_KEY is invalid');
@@ -232,6 +245,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '32kb', strict: true }));
 app.use('/api/report', createRateLimiter({ windowMs: 60_000, max: 30, message: 'Too many report requests. Try again later.' }));
+app.use('/api/market-watch', createRateLimiter({ windowMs: 60_000, max: 30, message: 'Too many market watch requests. Try again later.' }));
 
 function hostAuthorized(req: Request): boolean {
   if (!isUsableSecret(HOST_TOKEN)) return false;
@@ -290,6 +304,56 @@ function currentRiskState(): RiskState {
   return state.riskState;
 }
 
+function tickerObservedAt(): string | undefined {
+  const raw = state.ticker?.raw;
+  if (!raw || typeof raw !== 'object') return undefined;
+  const observedAt = (raw as Record<string, unknown>).observedAt;
+  return typeof observedAt === 'string' ? observedAt : undefined;
+}
+
+function marketAgeSeconds(): number | null {
+  const observedAt = tickerObservedAt();
+  if (!observedAt) return null;
+  const timestamp = Date.parse(observedAt);
+  if (!Number.isFinite(timestamp)) return null;
+  const ageMs = Date.now() - timestamp;
+  if (ageMs < 0) return null;
+  return Math.floor(ageMs / 1000);
+}
+
+function marketFreshness(): 'FRESH' | 'STALE' | 'WAITING' {
+  const age = marketAgeSeconds();
+  if (age === null) return 'WAITING';
+  return age <= 15 ? 'FRESH' : 'STALE';
+}
+
+function stampTicker(ticker: BinanceTicker, source: 'MCP' | 'FALLBACK'): BinanceTicker {
+  return {
+    ...ticker,
+    raw: { source, observedAt: new Date().toISOString() },
+  };
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>'"]/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    "'": '&#39;',
+    '"': '&quot;',
+  })[character] ?? character);
+}
+
+async function readJudgeValidation(): Promise<Record<string, unknown> | undefined> {
+  try {
+    const contents = await readFile(JUDGE_VALIDATION_FILE, 'utf8');
+    const parsed: unknown = JSON.parse(contents);
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function publicState(): Record<string, unknown> {
   const proposal = state.proposal;
   const futuresContext = state.futuresContext;
@@ -301,6 +365,9 @@ function publicState(): Record<string, unknown> {
     mcpStatus: state.mcpStatus,
     mcpTools: state.mcpTools.slice(0, 200),
     marketSource: state.marketSource,
+    marketObservedAt: tickerObservedAt(),
+    marketAgeSeconds: marketAgeSeconds(),
+    marketFreshness: marketFreshness(),
     ticker: state.ticker ? {
       symbol: state.ticker.symbol,
       price: state.ticker.price,
@@ -442,13 +509,13 @@ function publicState(): Record<string, unknown> {
   };
 }
 
-async function readPublicRestTicker(): Promise<BinanceTicker> {
-  const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr', { params: { symbol: SYMBOL }, timeout: 10_000 });
+async function readPublicRestTickerFor(symbol: string): Promise<BinanceTicker> {
+  const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr', { params: { symbol }, timeout: 10_000 });
   const data = response.data as Record<string, unknown>;
   const price = Number.parseFloat(`${data.lastPrice ?? ''}`);
   if (!Number.isFinite(price)) throw new Error('Binance public REST fallback returned no lastPrice');
   return {
-    symbol: `${data.symbol ?? SYMBOL}`,
+    symbol: `${data.symbol ?? symbol}`,
     price,
     changePercent: Number.parseFloat(`${data.priceChangePercent ?? ''}`),
     highPrice: Number.parseFloat(`${data.highPrice ?? ''}`),
@@ -458,6 +525,10 @@ async function readPublicRestTicker(): Promise<BinanceTicker> {
     quoteVolume: Number.parseFloat(`${data.quoteVolume ?? ''}`),
     raw: data,
   };
+}
+
+async function readPublicRestTicker(): Promise<BinanceTicker> {
+  return readPublicRestTickerFor(SYMBOL);
 }
 
 function updateMarketSignal(ticker: BinanceTicker): void {
@@ -477,7 +548,7 @@ async function refreshMarketData(): Promise<void> {
       const ticker = await readPublicRestTicker();
       state.mcpStatus = 'error';
       state.marketSource = 'FALLBACK';
-      state.ticker = ticker;
+      state.ticker = stampTicker(ticker, 'FALLBACK');
       updateMarketSignal(ticker);
       touch(`FALLBACK market data live ${ticker.symbol} ${ticker.price}`);
       await audit('seller.market.read', { source: 'FALLBACK', symbol: ticker.symbol, price: ticker.price, reason: 'Supported Binance MCP host has not published data yet' });
@@ -494,7 +565,7 @@ async function refreshMarketData(): Promise<void> {
     state.mcpStatus = 'live';
     state.mcpTools = mcp.toolNames;
     state.marketSource = 'MCP';
-    state.ticker = ticker;
+    state.ticker = stampTicker(ticker, 'MCP');
     updateMarketSignal(ticker);
     state.lastError = undefined;
     touch(`MCP market data live ${ticker.symbol} ${ticker.price}`);
@@ -512,7 +583,7 @@ async function refreshMarketData(): Promise<void> {
     try {
       const ticker = await readPublicRestTicker();
       state.marketSource = 'FALLBACK';
-      state.ticker = ticker;
+      state.ticker = stampTicker(ticker, 'FALLBACK');
       updateMarketSignal(ticker);
       touch(`FALLBACK market data live ${ticker.symbol} ${ticker.price}`);
       await audit('seller.market.read', { source: 'FALLBACK', symbol: ticker.symbol, price: ticker.price, reason: state.lastError });
@@ -633,11 +704,11 @@ function receiptHeader(receipt: SettlementReceipt): string {
 }
 
 async function deliverFreeBriefing(res: Response): Promise<void> {
-  if (!state.futuresRisk && !state.ticker) await refreshMarketData();
-  if (!state.futuresRisk && !state.ticker) {
-    state.lastError = 'No live market data is available';
+  if (!state.futuresRisk && (!state.ticker || marketFreshness() !== 'FRESH')) await refreshMarketData();
+  if (!state.futuresRisk && (!state.ticker || state.marketSource === 'UNAVAILABLE' || marketFreshness() !== 'FRESH')) {
+    state.lastError = marketFreshness() === 'STALE' ? 'Live market data is stale' : 'No live market data is available';
     state.paymentStatus = 'error';
-    touch('Free briefing refused because no live market data is available.');
+    touch(`Free briefing refused because ${state.lastError.toLowerCase()}.`);
     await audit('seller.briefing.refused', { accessMode: 'free', error: state.lastError });
     res.status(503).json({ success: false, error: state.lastError, accessMode: 'free' });
     return;
@@ -666,6 +737,7 @@ async function deliverFreeBriefing(res: Response): Promise<void> {
 
 app.get('/', (_req, res) => {
   const nonce = dashboardCspNonce(res);
+  const marketWatchOptions = MARKET_WATCH_SYMBOLS.map((symbol) => `<option value="${escapeHtml(symbol)}"${symbol === SYMBOL ? ' selected' : ''}>${escapeHtml(symbol)}</option>`).join('');
   const turnstileScript = TURNSTILE_SITE_KEY ? `<script nonce="${nonce}" src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>` : '';
   const turnstileWidget = TURNSTILE_SITE_KEY ? `<div class="cf-turnstile mt-4" data-sitekey="${TURNSTILE_SITE_KEY}" data-callback="signal402Turnstile"></div>` : '';
   res.type('html').send(`<!doctype html>
@@ -732,12 +804,14 @@ body[data-theme="light"] [class*="bg-amber/"]{background-color:rgba(125,92,0,.1)
 <body data-theme="dark"><div id="loginPanel" class="fixed inset-0 z-50 flex items-center justify-center bg-ink/95 px-5"><form id="loginForm" class="w-full max-w-sm rounded-2xl border border-line bg-panel p-6 shadow-2xl"><div class="flex items-center justify-between gap-3"><p class="text-xs uppercase tracking-[.24em] text-cyan">Signal402 dashboard</p><button type="button" class="theme-toggle" data-theme-toggle aria-pressed="false">☼ <span>LIGHT MODE</span></button></div><h2 class="mt-3 text-2xl font-semibold">Sign in to approve trades</h2><p class="mt-3 text-sm leading-6 text-slate-400">The dashboard can show public market status, but order approval requires a server side session.</p><label class="mt-5 block text-sm text-slate-300" for="password">Dashboard password</label><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256" class="mt-2 w-full rounded-lg border border-line bg-ink px-3 py-3 text-sm text-white outline-none focus:border-cyan"><input id="turnstileToken" name="turnstileToken" type="hidden"><input name="website" type="text" tabindex="-1" autocomplete="off" class="hidden">${turnstileWidget}<button class="mt-5 w-full rounded-xl bg-cyan px-4 py-3 text-sm font-bold text-ink">SIGN IN</button><p id="loginError" class="mt-3 min-h-5 text-sm text-rose-300" role="alert"></p></form></div><main class="mx-auto min-h-screen max-w-7xl px-5 py-8 lg:px-10">
 <header class="mb-8 flex flex-col gap-5 border-b border-line pb-6 sm:flex-row sm:items-end sm:justify-between">
 <div><div class="mb-3 flex items-center gap-3"><span class="rounded-full border border-cyan/30 bg-cyan/10 px-3 py-1 text-xs font-bold tracking-[.25em] text-cyan">SIGNAL402</span><span class="text-xs uppercase tracking-[.22em] text-slate-500">Binance Agent OS</span></div><p class="mono mb-3 text-[10px] font-semibold uppercase tracking-[.28em] text-slate-500">Execution control room / live evidence only</p><h1 class="text-3xl font-semibold tracking-tight sm:text-5xl">The decision layer for agent trading</h1><p class="mt-3 max-w-2xl text-sm leading-6 text-slate-400">A live Seller Agent publishes ${FREE_ACCESS ? 'free' : 'paid'} Spot or Futures intelligence. Directional USD M orders pass a deterministic risk gate, dashboard approval, and a final CONFIRM step. Neutral and COIN M paths are report only.</p></div>
-<div class="flex flex-wrap gap-2 text-xs font-semibold"><span id="mcpBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">MCP: CONNECTING</span><span id="sourceBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">DATA: WAITING</span><span id="paymentModeBadge" class="rounded-full border ${FREE_ACCESS ? 'border-amber-500/40 bg-amber-500/10 text-amber-300' : 'border-cyan/30 bg-cyan/10 text-cyan'} px-3 py-2">${FREE_ACCESS ? 'ACCESS: FREE' : 'PAYMENT: B402'}</span><span class="rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-rose-300">WITHDRAWAL: NEVER</span><button type="button" class="theme-toggle" data-theme-toggle aria-pressed="false">☼ <span>LIGHT MODE</span></button><button id="logout" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">SIGN OUT</button></div>
+<div class="flex flex-wrap gap-2 text-xs font-semibold"><span id="mcpBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">MCP: CONNECTING</span><span id="sourceBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">DATA: WAITING</span><span id="freshnessBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">AGE: WAITING</span><span id="paymentModeBadge" class="rounded-full border ${FREE_ACCESS ? 'border-amber-500/40 bg-amber-500/10 text-amber-300' : 'border-cyan/30 bg-cyan/10 text-cyan'} px-3 py-2">${FREE_ACCESS ? 'ACCESS: FREE' : 'PAYMENT: B402'}</span><span class="rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-rose-300">WITHDRAWAL: NEVER</span><button type="button" class="theme-toggle" data-theme-toggle aria-pressed="false">☼ <span>LIGHT MODE</span></button><button id="logout" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">SIGN OUT</button></div>
 </header>
 <section class="grid gap-5 lg:grid-cols-[1.1fr_.9fr]">
 <article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-cyan">Seller Agent</p><h2 class="mt-2 text-2xl font-semibold">Analyst Agent</h2></div><span class="rounded-lg border border-cyan/20 bg-cyan/10 px-3 py-2 text-xs text-cyan">LIVE FEED</span></div><div class="grid gap-4 sm:grid-cols-3"><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Pair</p><p id="pair" class="mt-2 text-xl font-semibold">${SYMBOL}</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Last price</p><p id="price" class="mt-2 text-xl font-semibold text-lime">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">24h change</p><p id="change" class="mt-2 text-xl font-semibold">Waiting</p></div></div><div class="mt-5 rounded-xl border border-line bg-ink p-4"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Verified intelligence</span><span id="signalAction" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-300">WAITING</span></div><div class="mt-4 grid gap-3 sm:grid-cols-3 text-sm"><div><p class="text-xs text-slate-500">Direction</p><p id="signalDirection" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Risk tier</p><p id="signalRisk" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Confidence</p><p id="signalConfidence" class="mt-1 font-semibold">Waiting</p></div></div><p id="signalRationale" class="mt-4 text-sm leading-6 text-slate-400">${FREE_ACCESS ? 'Free agent access is enabled. No B402 payment is requested or recorded.' : 'The paid report combines live Binance data with an explainable screening rule.'}</p></div><div class="mt-5 rounded-xl border border-line bg-ink p-4"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">${FREE_ACCESS ? 'Free agent briefing' : 'Research paywall'}</span><span id="paymentPrice" class="text-sm font-semibold ${FREE_ACCESS ? 'text-amber-300' : 'text-cyan'}">${FREE_ACCESS ? 'FREE' : '0.01 USDC'}</span></div><p class="mt-3 text-sm leading-6 text-slate-400">${FREE_ACCESS ? 'Free agent access. No payment was requested. Real Binance data and trade safety checks remain active.' : 'Real Binance B402 v2 settlement. The briefing is withheld until verification and on-chain settlement succeed.'}</p><p id="paymentReceipt" class="mt-3 break-all font-mono text-xs text-slate-500">${FREE_ACCESS ? 'Access: FREE · no payment requested' : 'Receipt: waiting'}</p></div></article>
-<article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Buyer Agent</p><h2 class="mt-2 text-2xl font-semibold">Trader Agent</h2></div><span class="rounded-lg border border-lime/20 bg-lime/10 px-3 py-2 text-xs text-lime">HUMAN GATE</span></div><div class="rounded-xl border border-line bg-ink p-5"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Risk Guardian</span><span id="riskBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-400">idle</span></div><p id="riskReason" class="mt-4 text-sm leading-6 text-slate-400">Waiting for a buyer proposal backed by a live balance read.</p><div class="mt-5 grid gap-3 text-sm sm:grid-cols-3"><div><p class="text-xs text-slate-500">Proposed size</p><p id="tradeSize" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT before</p><p id="balance" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT after</p><p id="balanceAfter" class="mt-1 font-semibold">Waiting</p></div></div><button id="approve" class="mt-6 hidden w-full rounded-xl bg-lime px-4 py-3 text-sm font-bold text-ink transition hover:bg-lime/80">APPROVE</button><p id="order" class="mt-4 break-all font-mono text-xs text-slate-500">Order: waiting</p></div></article>
+<article class="glow rounded-2xl border border-line bg-panel p-6"><div class="mb-5 flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Buyer Agent</p><h2 class="mt-2 text-2xl font-semibold">Trader Agent</h2></div><span class="rounded-lg border border-lime/20 bg-lime/10 px-3 py-2 text-xs text-lime">HUMAN GATE</span></div><div class="rounded-xl border border-line bg-ink p-5"><div class="flex items-center justify-between"><span class="text-xs uppercase tracking-[.18em] text-slate-500">Risk Guardian</span><span id="riskBadge" class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-400">idle</span></div><p id="riskReason" class="mt-4 text-sm leading-6 text-slate-400">Waiting for a buyer proposal backed by a live balance read.</p><p id="riskChecklist" class="mt-3 rounded-lg border border-line bg-panel px-3 py-3 font-mono text-xs leading-5 text-slate-500">Gate trace: signal waiting · balance read required · data age waiting · Spot cap 10 USDT</p><div class="mt-5 grid gap-3 text-sm sm:grid-cols-3"><div><p class="text-xs text-slate-500">Proposed size</p><p id="tradeSize" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT before</p><p id="balance" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">USDT after</p><p id="balanceAfter" class="mt-1 font-semibold">Waiting</p></div></div><button id="approve" class="mt-6 hidden w-full rounded-xl bg-lime px-4 py-3 text-sm font-bold text-ink transition hover:bg-lime/80">APPROVE</button><p id="order" class="mt-4 break-all font-mono text-xs text-slate-500">Order: waiting</p></div></article>
 </section>
+<section class="mt-5 grid gap-5 lg:grid-cols-[1.1fr_.9fr]"><article class="glow rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-cyan">Runtime evidence</p><h2 class="mt-2 text-2xl font-semibold">MCP tool ledger</h2></div><span id="evidenceSource" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">WAITING</span></div><div class="mt-5 grid gap-3 sm:grid-cols-3"><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Observed at</p><p id="marketObserved" class="mt-1 font-mono text-xs font-semibold">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Data age</p><p id="marketAge" class="mt-1 font-semibold">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Runtime tools</p><p id="mcpToolCount" class="mt-1 font-semibold">0</p></div></div><div class="mt-5"><p class="text-xs uppercase tracking-[.18em] text-slate-500">Exact tool names supplied by the host</p><div id="mcpTools" class="mt-3 flex flex-wrap gap-2"><span class="rounded-lg border border-line bg-ink px-3 py-2 font-mono text-xs text-slate-500">Waiting for runtime discovery</span></div></div><p class="mt-5 text-sm leading-6 text-slate-400">Only tool names and timestamps are shown here. OAuth tokens and raw MCP payloads stay inside the supported host.</p></article><article class="glow rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Judge readiness</p><h2 class="mt-2 text-2xl font-semibold">Proof without guesswork</h2></div><button id="refreshJudge" type="button" class="rounded-lg border border-line bg-ink px-3 py-2 text-xs font-bold text-slate-300 transition hover:border-cyan hover:text-cyan">REFRESH</button></div><div class="mt-5 space-y-3 text-sm"><div class="flex items-center justify-between rounded-lg border border-line bg-ink px-3 py-3"><span>Local build, tests, audit</span><span id="judgeLocal" class="font-mono text-xs text-slate-400">NOT RUN</span></div><div class="flex items-center justify-between rounded-lg border border-line bg-ink px-3 py-3"><span>Live MCP context</span><span id="judgeMcp" class="font-mono text-xs text-slate-400">WAITING</span></div><div class="flex items-center justify-between rounded-lg border border-line bg-ink px-3 py-3"><span>Risk state</span><span id="judgeRisk" class="font-mono text-xs text-slate-400">WAITING</span></div></div><p id="judgeMessage" class="mt-5 rounded-xl border border-line bg-ink p-4 text-sm leading-6 text-slate-400">Run npm run validate:judge to create the local proof report. Live readiness also needs fresh MCP context.</p></article></section>
+<section class="mt-5"><article class="glow rounded-2xl border border-line bg-panel p-6"><div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-amber-300">Market watch</p><h2 class="mt-2 text-2xl font-semibold">Compare pairs safely</h2><p class="mt-2 text-sm leading-6 text-slate-400">Read only public Binance REST data for context. This watch does not change the configured trading pair and cannot place an order.</p></div><div class="flex items-center gap-2"><label for="watchSymbol" class="sr-only">Watch pair</label><select id="watchSymbol" class="min-h-11 rounded-lg border border-line bg-ink px-3 py-2 text-sm font-semibold text-white outline-none focus:border-cyan">${marketWatchOptions}</select><button id="refreshWatch" type="button" class="min-h-11 rounded-lg border border-line bg-ink px-3 py-2 text-xs font-bold text-slate-300 transition hover:border-cyan hover:text-cyan">REFRESH</button></div></div><div class="mt-5 grid gap-3 sm:grid-cols-4"><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Watch price</p><p id="watchPrice" class="mt-1 text-lg font-semibold text-lime">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">24h change</p><p id="watchChange" class="mt-1 text-lg font-semibold">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Watch source</p><p id="watchSource" class="mt-1 font-mono text-xs font-semibold">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Observed at</p><p id="watchObserved" class="mt-1 font-mono text-xs font-semibold">Waiting</p></div></div><p id="watchNote" class="mt-4 text-xs leading-5 text-slate-500">Select a pair to query the server allowlist.</p></article></section>
 <section class="mt-5 grid gap-5 lg:grid-cols-[1.1fr_.9fr]"><article class="glow rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-cyan">Futures risk gate</p><h2 class="mt-2 text-2xl font-semibold">USDⓈ M and COIN M analysis</h2></div><span id="futuresMcpBadge" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">MCP: WAITING</span></div><div class="mt-5 grid gap-3 sm:grid-cols-3"><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Contract</p><p id="futuresContract" class="mt-1 font-semibold">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Strategy</p><p id="futuresStrategy" class="mt-1 font-semibold">Waiting</p></div><div class="rounded-xl border border-line bg-ink p-4"><p class="text-xs text-slate-500">Decision</p><p id="futuresDecision" class="mt-1 font-semibold">Waiting</p></div></div><div class="mt-4 grid gap-3 text-sm sm:grid-cols-3"><div><p class="text-xs text-slate-500">Risk zone</p><p id="futuresRiskZone" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Eligibility</p><p id="futuresEligibility" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Leverage / margin</p><p id="futuresLeverage" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Available margin</p><p id="futuresAvailable" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Maintenance margin</p><p id="futuresMaintenance" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Funding</p><p id="futuresFunding" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Spread / slippage</p><p id="futuresSpread" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Liquidation distance</p><p id="futuresLiquidation" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Hedge ratio</p><p id="futuresHedge" class="mt-1 font-semibold">Not applicable</p></div></div><p id="futuresReasons" class="mt-5 rounded-xl border border-line bg-ink p-4 text-sm leading-6 text-slate-400">Waiting for strict live Futures context.</p><p id="futuresPaymentReceipt" class="mt-4 break-all font-mono text-xs text-slate-500">${FREE_ACCESS ? 'Access: FREE · no payment requested' : 'Payment receipt: waiting'}</p></article><article class="glow rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-lime">Futures execution</p><h2 class="mt-2 text-2xl font-semibold">Approval and event trail</h2></div><span id="futuresApprovalState" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">REPORT ONLY</span></div><p id="futuresOrder" class="mt-5 break-all font-mono text-xs text-slate-500">Order: waiting</p><p id="futuresBalances" class="mt-3 text-sm text-slate-400">Futures balances before and after: waiting</p><button id="approveFutures" class="mt-6 hidden w-full rounded-xl bg-lime px-4 py-3 text-sm font-bold text-ink transition hover:bg-lime/80">APPROVE FUTURES ORDER</button><p id="futuresConfirm" class="mt-4 text-sm leading-6 text-slate-400">Directional USD M execution also requires the host to ask for CONFIRM after this approval.</p><div class="mt-6"><p class="text-xs uppercase tracking-[.18em] text-slate-500">Futures event timeline</p><div id="futuresEvents" class="mono mt-3 max-h-64 space-y-2 overflow-auto text-xs leading-5 text-slate-400"><p>Waiting for authenticated Futures events.</p></div></div></article></section>
 <section class="mt-5 grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><div><p class="text-xs uppercase tracking-[.24em] text-rose-300">Risk controls</p><h2 class="mt-2 text-2xl font-semibold">Persistent guard</h2></div><span id="riskStateBadge" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">NORMAL</span></div><p id="riskStateReason" class="mt-4 text-sm leading-6 text-slate-400">New exposure is allowed only while the persistent risk state is normal.</p><button id="killSwitch" class="mt-5 w-full rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm font-bold text-rose-300 transition hover:bg-rose-500/20">ENABLE KILL SWITCH</button><div class="mt-5 space-y-3 text-sm text-slate-300"><p>✓ Kill switch and drawdown state survive a process restart.</p><p>✓ A halted state blocks new Spot and Futures proposals.</p><p>✓ Existing orders are never cancelled by this control.</p></div></article><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Binance CEX carry</p><span id="carryDecision" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-400">WAITING</span></div><p class="mt-3 text-sm leading-6 text-slate-400">A transparent Spot and Futures basis report. It is report only and never submits a hedge.</p><div class="mt-5 grid gap-3 text-sm sm:grid-cols-3"><div><p class="text-xs text-slate-500">Basis</p><p id="carryBasis" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Funding carry</p><p id="carryFunding" class="mt-1 font-semibold">Waiting</p></div><div><p class="text-xs text-slate-500">Net expected</p><p id="carryNet" class="mt-1 font-semibold">Waiting</p></div></div><p id="carryEvidence" class="mt-5 break-all font-mono text-xs text-slate-500">Waiting for authenticated Binance market context.</p></article></section>
 <section class="mt-5 grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><article class="rounded-2xl border border-line bg-panel p-6"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Safety model</p><div class="mt-4 space-y-3 text-sm text-slate-300"><p>✓ Supported host mode keeps Binance OAuth outside Signal402.</p><p>✓ Direct OAuth is disabled unless Binance approves this client.</p><p>✓ No withdrawal scope exists in Binance Agent OS.</p><p>✓ Every Spot or Futures order requires human approval.</p><p>✓ Combined Futures notional is capped at 10 USDT and leverage at 3x.</p><p>✓ Futures use isolated margin only. Signal402 never changes leverage or margin mode.</p><p>✓ Neutral and COIN M Futures paths are report only.</p><p>✓ Every action is appended to a local JSONL audit log.</p></div></article><article class="rounded-2xl border border-line bg-panel p-6"><div class="flex items-center justify-between"><p class="text-xs uppercase tracking-[.24em] text-slate-500">Agent activity</p><span id="updated" class="font-mono text-xs text-slate-600">waiting</span></div><div id="activity" class="mono mt-4 max-h-56 space-y-2 overflow-auto text-xs leading-5 text-slate-400"><p>Waiting for the Seller Agent.</p></div></article></section>
@@ -756,6 +830,15 @@ async function approve(id){const button=document.getElementById('approve');butto
 async function approveFutures(id){const button=document.getElementById('approveFutures');button.disabled=true;button.textContent='APPROVING';const response=await fetch('/api/futures/approve',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({proposalId:id})});if(response.status===401){showLogin(true);return}await update()}
 async function update(){try{const response=await fetch('/api/state',{cache:'no-store',credentials:'same-origin'});if(response.status===401){showLogin(true);return}if(!response.ok)throw new Error('Dashboard state unavailable');const s=await response.json();showLogin(false);set('mcpBadge',s.mcpStatus==='live'?'MCP: LIVE':s.marketSource==='FALLBACK'?'MCP: FALLBACK':s.mcpStatus==='error'?'MCP: ERROR':'MCP: CONNECTING');set('sourceBadge',s.marketSource==='MCP'?'DATA: MCP LIVE':s.marketSource==='FALLBACK'?'DATA: FALLBACK':'DATA: WAITING');set('paymentModeBadge',s.accessMode==='free'?'ACCESS: FREE':'PAYMENT: B402');if(s.ticker){set('pair',s.ticker.symbol);set('price',Number(s.ticker.price).toFixed(8)+' USDT');set('change',Number.isFinite(Number(s.ticker.changePercent))?Number(s.ticker.changePercent).toFixed(2)+'%':'Unavailable')}const signal=s.marketSignal;if(signal){const action=document.getElementById('signalAction');set('signalAction',signal.action);action.className='rounded-full border px-3 py-1 text-xs '+(signal.action==='BUY_SMALL'?'border-lime/40 bg-lime/10 text-lime':'border-rose-500/40 bg-rose-500/10 text-rose-300');set('signalDirection',signal.direction);set('signalRisk',signal.risk);set('signalConfidence',signal.confidence);set('signalRationale',signal.rationale)}set('paymentReceipt',s.accessMode==='free'?'Access: FREE · no payment requested':s.paymentReceiptId?'Receipt: '+s.paymentReceiptId:'Receipt: waiting');set('updated',new Date(s.updatedAt).toLocaleTimeString());const p=s.proposal;const badge=document.getElementById('riskBadge');const button=document.getElementById('approve');if(p){set('riskBadge',p.status==='refused'?'RISK GUARDIAN: refused':p.status==='filled'?'TRADE FILLED':p.status==='approved'?'APPROVED':p.status.toUpperCase());badge.className='rounded-full border px-3 py-1 text-xs '+(p.status==='refused'?'border-rose-500/40 bg-rose-500/10 text-rose-300':p.status==='filled'?'border-lime/40 bg-lime/10 text-lime':'border-cyan/40 bg-cyan/10 text-cyan');set('riskReason',p.reason);set('tradeSize',Number(p.amountUSDT).toFixed(2)+' USDT');const beforeUsdt=usdt(p.beforeBalances);const afterUsdt=usdt(p.afterBalances);set('balance',(beforeUsdt===undefined?Number(p.balanceUSDT).toFixed(2):beforeUsdt.toFixed(8))+' USDT');set('balanceAfter',afterUsdt===undefined?'Waiting':afterUsdt.toFixed(8)+' USDT');set('order',p.orderId?'Order: '+p.orderId+(p.filledPrice?' · filled price '+Number(p.filledPrice).toFixed(8):''):'Order: waiting');if(p.status==='pending'){button.classList.remove('hidden');button.disabled=false;button.textContent='APPROVE';button.onclick=()=>approve(p.proposalId)}else{button.classList.add('hidden')}}else{button.classList.add('hidden')};const f=s.futures||{};const fc=f.context;const fr=f.risk;const fp=f.proposal;set('futuresMcpBadge',fc?'MCP: LIVE':'MCP: WAITING');if(fc){set('futuresContract',String(fc.marketType||'Unknown'));set('futuresStrategy',String(fc.strategyMode||'Unknown'));set('futuresLeverage',Number(fc.leverage).toFixed(2)+'x / '+String(fc.marginMode||'Unknown'));set('futuresAvailable',Number(fc.availableBalanceUSDT).toFixed(4)+' USDT');set('futuresMaintenance',Number(fc.maintenanceMarginUSDT).toFixed(4)+' USDT');set('futuresFunding',fr&&fr.fundingRateBps!==null?Number(fr.fundingRateBps).toFixed(2)+' bps':'Unavailable');set('futuresSpread',fr&&fr.spreadBps!==null?Number(fr.spreadBps).toFixed(2)+' / '+Number(fr.slippageBps).toFixed(2)+' bps':'Unavailable');set('futuresLiquidation',fr&&fr.liquidationDistancePct!==null?Number(fr.liquidationDistancePct).toFixed(2)+'%':'Unavailable');set('futuresHedge',fr&&fr.hedgeRatio!==null?Number(fr.hedgeRatio).toFixed(4):'Not applicable')}else{['futuresContract','futuresStrategy','futuresDecision','futuresRiskZone','futuresEligibility','futuresLeverage','futuresAvailable','futuresMaintenance','futuresFunding','futuresSpread','futuresLiquidation'].forEach((id)=>set(id,'Waiting'));set('futuresHedge','Not applicable')}if(fr){set('futuresDecision',fr.action);set('futuresRiskZone',fr.riskZone);set('futuresEligibility',fr.executionEligible?'ELIGIBLE':'REPORT ONLY / BLOCKED');set('futuresReasons',fr.reasons&&fr.reasons.length?fr.reasons.join(' '):'All strict live Futures checks passed.');set('futuresPaymentReceipt',s.accessMode==='free'?'Access: FREE · no payment requested':s.paymentReceiptId?'Payment receipt: '+s.paymentReceiptId:'Payment receipt: waiting')}else{set('futuresReasons','Waiting for strict live Futures context.');set('futuresPaymentReceipt',s.accessMode==='free'?'Access: FREE · no payment requested':s.paymentReceiptId?'Payment receipt: '+s.paymentReceiptId:'Payment receipt: waiting')}const futuresButton=document.getElementById('approveFutures');if(fp){const reportOnly=fp.marketType!=='USD_M'||fp.strategyMode!=='directional'||(fr&&!fr.executionEligible);set('futuresApprovalState',fp.status==='filled'?'FILLED':fp.status==='approved'?'APPROVED · CONFIRM REQUIRED':fp.status==='pending'?'WAITING APPROVAL':fp.status.toUpperCase());set('futuresOrder',fp.orderId?'Order: '+fp.orderId+(fp.filledPrice?' · fill '+Number(fp.filledPrice).toFixed(8)+' · qty '+Number(fp.executedQty||0).toFixed(8):''):'Order: waiting');set('futuresConfirm',reportOnly?'REPORT ONLY. No approval button and no order write is permitted.':'Dashboard approval is recorded. The host must still require CONFIRM before one live USD M order.');if(fp.status==='pending'&&!reportOnly){futuresButton.classList.remove('hidden');futuresButton.disabled=false;futuresButton.textContent='APPROVE FUTURES ORDER';futuresButton.onclick=()=>approveFutures(fp.proposalId)}else{futuresButton.classList.add('hidden')}}else{futuresButton.classList.add('hidden');set('futuresApprovalState',fr&&fr.reportOnly?'REPORT ONLY':'WAITING');set('futuresOrder','Order: waiting')}const beforeAccount=fp&&fp.beforeAccountSnapshot;const afterAccount=fp&&fp.afterAccountSnapshot;if(beforeAccount&&afterAccount){set('futuresBalances','Wallet before '+Number(beforeAccount.walletBalanceUSDT).toFixed(8)+' USDT · after '+Number(afterAccount.walletBalanceUSDT).toFixed(8)+' USDT · available after '+Number(afterAccount.availableBalanceUSDT).toFixed(8)+' USDT')}else{set('futuresBalances','Futures balances before and after: waiting')};const eventTarget=document.getElementById('futuresEvents');eventTarget.replaceChildren(...(Array.isArray(f.events)?f.events:[]).map((event)=>{const p=document.createElement('p');p.textContent=String(event.observedAt||'')+' · '+String(event.eventType||'')+' · '+String(event.status||'')+(event.orderId?' · '+String(event.orderId):'');return p}));if(!eventTarget.childElementCount){const p=document.createElement('p');p.textContent='Waiting for authenticated Futures events.';eventTarget.appendChild(p)}renderActivity(s.activity)}catch(e){console.error(e)}}
 document.getElementById('loginForm').addEventListener('submit',login);document.getElementById('logout').addEventListener('click',logout);showLogin(true);update();setInterval(update,1500);
+</script><script nonce="${nonce}">
+(function(){
+const evidenceSet=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value};
+const renderTools=(names)=>{const target=document.getElementById('mcpTools');if(!target)return;const safeNames=Array.isArray(names)?names.slice(0,24).map((name)=>String(name)).filter(Boolean):[];target.replaceChildren(...safeNames.map((name)=>{const chip=document.createElement('span');chip.className='rounded-lg border border-cyan/20 bg-cyan/10 px-3 py-2 font-mono text-xs text-cyan';chip.textContent=name;return chip}));if(!target.childElementCount){const chip=document.createElement('span');chip.className='rounded-lg border border-line bg-ink px-3 py-2 font-mono text-xs text-slate-500';chip.textContent='Waiting for runtime discovery';target.appendChild(chip)}};
+async function refreshEvidence(){try{const response=await fetch('/api/state',{cache:'no-store',credentials:'same-origin'});if(!response.ok)return;const s=await response.json();const freshness=String(s.marketFreshness||'WAITING');const age=Number.isFinite(Number(s.marketAgeSeconds))?Number(s.marketAgeSeconds):undefined;evidenceSet('freshnessBadge',age===undefined?'AGE: '+freshness:'AGE: '+age+'s · '+freshness);evidenceSet('evidenceSource',s.marketSource==='MCP'?'MCP LIVE':s.marketSource==='FALLBACK'?'REST FALLBACK':'WAITING');evidenceSet('marketObserved',s.marketObservedAt?new Date(s.marketObservedAt).toLocaleTimeString():'Waiting');evidenceSet('marketAge',age===undefined?'Waiting':age+' seconds · '+freshness);evidenceSet('mcpToolCount',Array.isArray(s.mcpTools)?String(s.mcpTools.length):'0');renderTools(s.mcpTools);const signal=s.marketSignal?.action||'WAITING';const balance=s.proposal?(s.proposal.riskStatus==='approved'?'PASS':'REFUSED'):'READ REQUIRED';evidenceSet('riskChecklist','Gate trace: signal '+signal+' · balance '+balance+' · data age '+freshness+' · Spot cap 10 USDT')}catch(_error){}}
+async function refreshWatch(){const select=document.getElementById('watchSymbol');if(!select)return;const button=document.getElementById('refreshWatch');if(button){button.disabled=true;button.textContent='LOADING'}try{const response=await fetch('/api/market-watch?symbol='+encodeURIComponent(select.value),{cache:'no-store'});const data=await response.json().catch(()=>({}));if(!response.ok){evidenceSet('watchNote',String(data.error||'Public market watch is unavailable'));return}const ticker=data.ticker||{};evidenceSet('watchPrice',Number.isFinite(Number(ticker.price))?Number(ticker.price).toFixed(8)+' USDT':'Unavailable');evidenceSet('watchChange',Number.isFinite(Number(ticker.changePercent))?Number(ticker.changePercent).toFixed(2)+'%':'Unavailable');evidenceSet('watchSource',String(data.source||'PUBLIC REST'));evidenceSet('watchObserved',data.observedAt?new Date(data.observedAt).toLocaleTimeString():'Unavailable');evidenceSet('watchNote',String(data.note||'Read only market watch.'))}catch(_error){evidenceSet('watchNote','Public market watch is unavailable')}finally{if(button){button.disabled=false;button.textContent='REFRESH'}}}
+async function refreshJudge(){try{const response=await fetch('/api/judge/status',{cache:'no-store'});if(!response.ok)return;const data=await response.json();const local=data.localChecks||{};const runtime=data.runtime||{};evidenceSet('judgeLocal',local.status==='PASS'?'PASS · '+new Date(local.completedAt).toLocaleTimeString():'RUN npm run validate:judge');evidenceSet('judgeMcp',runtime.mcp?'MCP: LIVE':'WAITING');evidenceSet('judgeRisk',String(runtime.riskState||'WAITING'));evidenceSet('judgeMessage',data.readyForLiveMcpDemo?'Local proof and fresh MCP context are ready. No order evidence is created by this check.':local.status!=='PASS'?'Run npm run validate:judge for the local proof report. Live readiness still needs fresh MCP context.':'Local proof passes. Connect the supported Binance MCP host and publish fresh market data for live readiness.')}catch(_error){}}
+document.getElementById('refreshWatch')?.addEventListener('click',refreshWatch);document.getElementById('watchSymbol')?.addEventListener('change',refreshWatch);document.getElementById('refreshJudge')?.addEventListener('click',refreshJudge);refreshEvidence();refreshWatch();refreshJudge();setInterval(refreshEvidence,1500);setInterval(refreshJudge,5000);
+})();
 </script><script nonce="${nonce}">
 const controlSet=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value};
 async function refreshControls(){try{const response=await fetch('/api/state',{cache:'no-store',credentials:'same-origin'});if(!response.ok)return;const s=await response.json();const risk=s.riskState||{};const riskLabel=risk.killSwitch?'KILL SWITCH':risk.drawdownState||'NORMAL';controlSet('riskStateBadge',riskLabel);controlSet('riskStateReason',risk.killSwitchReason||((risk.drawdownState==='HALTED')?'Drawdown halt blocks new exposure.':risk.drawdownState==='WARN'?'Drawdown warning. New exposure remains subject to the normal gate.':'New exposure is allowed only while the persistent risk state is normal.'));const kill=document.getElementById('killSwitch');if(kill){kill.textContent=risk.killSwitch?'CLEAR KILL SWITCH':'ENABLE KILL SWITCH';kill.onclick=async()=>{await fetch('/api/risk/kill-switch',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({enabled:!risk.killSwitch,reason:!risk.killSwitch?'Operator action from Signal402 dashboard':undefined})});await refreshControls()}}const carry=s.carryReport;if(carry){controlSet('carryDecision',carry.decision+(carry.dataFresh?'':' · STALE'));controlSet('carryBasis',Number(carry.basisBps).toFixed(2)+' bps');controlSet('carryFunding',Number(carry.fundingCarryBps).toFixed(2)+' bps');controlSet('carryNet',Number(carry.netExpectedCarryBps).toFixed(2)+' bps');controlSet('carryEvidence','Input '+String(carry.inputHash)+' · output '+String(carry.outputHash))}}catch(_error){}}
@@ -825,8 +908,9 @@ app.get('/api/capabilities', (_req, res) => {
       spot: { marketData: true, marketBuy: true, maxNotionalUSDT: MAX_TRADE_SIZE_USDT },
       futures: { usdM: { directional: true, neutral: 'report-only' }, coinM: 'report-only', maxNotionalUSDT: MAX_FUTURES_NOTIONAL_USDT, maxLeverage: MAX_FUTURES_LEVERAGE, marginMode: 'ISOLATED' },
       carry: { venue: 'Binance CEX Spot and Futures', reportOnly: true },
+      marketWatch: { symbols: MARKET_WATCH_SYMBOLS, source: 'public-rest', reportOnly: true },
     },
-    safety: { humanApproval: true, confirmation: 'CONFIRM for USD M Futures', noWithdrawals: true, noTransfers: true, noApiKeys: true, publicRestFallback: ALLOW_PUBLIC_REST_FALLBACK },
+    safety: { humanApproval: true, confirmation: 'CONFIRM for USD M Futures', noWithdrawals: true, noTransfers: true, noApiKeys: true, publicRestFallback: ALLOW_PUBLIC_REST_FALLBACK, spotProposalMaxMarketAgeSeconds: 15 },
     secretsConfigured: { hostToken: isUsableSecret(HOST_TOKEN), dashboardPassword: DASHBOARD_AUTH.status().configured, b402Merchant: b402IsConfigured() },
   });
 });
@@ -896,7 +980,73 @@ app.post('/api/risk/equity', async (req, res) => {
   res.json({ success: true, riskState: snapshot });
 });
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, mcp: state.mcpStatus === 'live', marketSource: state.marketSource, binanceMode: state.binanceMode, riskState: currentRiskState() }));
+app.get('/api/health', (_req, res) => res.json({
+  ok: true,
+  mcp: state.mcpStatus === 'live',
+  marketSource: state.marketSource,
+  marketFreshness: marketFreshness(),
+  marketAgeSeconds: marketAgeSeconds(),
+  marketObservedAt: tickerObservedAt(),
+  binanceMode: state.binanceMode,
+  riskState: currentRiskState(),
+}));
+
+app.get('/api/market-watch', async (req, res) => {
+  const requested = typeof req.query.symbol === 'string' ? req.query.symbol.toUpperCase() : SYMBOL;
+  if (!MARKET_WATCH_SYMBOLS.includes(requested)) {
+    res.status(400).json({ success: false, error: 'Pair is not in the server allowlist', allowedSymbols: MARKET_WATCH_SYMBOLS });
+    return;
+  }
+  try {
+    const ticker = await readPublicRestTickerFor(requested);
+    const observedAt = new Date().toISOString();
+    await audit('seller.market.watch.read', { source: 'PUBLIC_REST', symbol: requested });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      success: true,
+      source: 'PUBLIC_REST_WATCH_ONLY',
+      symbol: requested,
+      observedAt,
+      ticker: {
+        symbol: ticker.symbol,
+        price: ticker.price,
+        changePercent: ticker.changePercent,
+        highPrice: ticker.highPrice,
+        lowPrice: ticker.lowPrice,
+        weightedAvgPrice: ticker.weightedAvgPrice,
+        quoteVolume: ticker.quoteVolume,
+      },
+      note: 'Read only market watch. This does not change the configured trading pair or enable order writes.',
+    });
+  } catch {
+    res.status(503).json({ success: false, error: 'Public Binance market watch is unavailable' });
+  }
+});
+
+app.get('/api/judge/status', async (_req, res) => {
+  const validation = await readJudgeValidation();
+  const liveMcp = state.mcpStatus === 'live' && state.marketSource === 'MCP';
+  const freshMarket = marketFreshness() === 'FRESH';
+  const localChecks = validation
+    ? { status: 'PASS', completedAt: validation.completedAt, checks: validation.checks }
+    : { status: 'NOT_RUN', command: 'npm run validate:judge' };
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    success: true,
+    localChecks,
+    runtime: {
+      mcp: liveMcp,
+      marketSource: state.marketSource,
+      marketFreshness: marketFreshness(),
+      marketAgeSeconds: marketAgeSeconds(),
+      marketObservedAt: tickerObservedAt(),
+      runtimeToolCount: state.mcpTools.length,
+      riskState: currentRiskState().killSwitch ? 'KILL_SWITCH' : currentRiskState().drawdownState,
+    },
+    readyForLiveMcpDemo: localChecks.status === 'PASS' && liveMcp && freshMarket,
+    note: 'This report shows runtime state only. It never creates payment, order, fill, or balance evidence.',
+  });
+});
 
 app.post('/api/host/market', async (req, res) => {
   if (!hostAuthorized(req)) {
@@ -1218,8 +1368,8 @@ app.post('/api/report', async (req, res) => {
       return;
     }
     const receipt = await verifyAndSettlePayment(signedPayment, required.requirement);
-    if (!state.futuresRisk && !state.ticker) await refreshMarketData();
-    if (!state.futuresRisk && (!state.ticker || state.marketSource === 'UNAVAILABLE')) throw new Error('No live market data is available after payment settlement');
+    if (!state.futuresRisk && (!state.ticker || marketFreshness() !== 'FRESH')) await refreshMarketData();
+    if (!state.futuresRisk && (!state.ticker || state.marketSource === 'UNAVAILABLE' || marketFreshness() !== 'FRESH')) throw new Error('No fresh live market data is available after payment settlement');
     const text = briefing();
     const paymentResponse = receiptHeader(receipt);
     state.reportsSold += 1;
@@ -1291,6 +1441,15 @@ app.post('/api/trade/proposal', async (req, res) => {
   const signal = state.marketSignal;
   if (!signal) {
     res.status(409).json({ success: false, error: 'No current market intelligence is available. Refusing proposal creation.' });
+    return;
+  }
+  const freshness = marketFreshness();
+  if (freshness !== 'FRESH') {
+    const reason = freshness === 'STALE'
+      ? 'Live market data is older than 15 seconds. Refresh the MCP context before proposing an order.'
+      : 'Live market data has no verified timestamp. Refusing proposal creation.';
+    await audit('seller.trade.refused', { proposalId: body.proposalId, reason, marketFreshness: freshness, marketAgeSeconds: marketAgeSeconds() });
+    res.status(409).json({ success: false, error: reason, marketFreshness: freshness, marketAgeSeconds: marketAgeSeconds() });
     return;
   }
   const signalApproved = signal.action === 'BUY_SMALL';
