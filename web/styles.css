@@ -14,7 +14,7 @@
 
 * { box-sizing: border-box; }
 
-html { background: var(--bg); }
+html { background: var(--bg); color-scheme: dark; }
 
 body {
   min-width: 320px;
@@ -77,6 +77,73 @@ a { color: inherit; }
   font-weight: 700;
   letter-spacing: .08em;
   text-transform: uppercase;
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 7px 10px;
+  color: var(--muted);
+  background: rgba(13, 25, 34, .72);
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  transition: border-color .18s ease, background .18s ease, color .18s ease, transform .18s ease;
+}
+
+.theme-toggle:hover { border-color: var(--teal); color: var(--text); transform: translateY(-1px); }
+.theme-toggle:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
+
+body[data-theme="light"] {
+  --bg: #f3f7f7;
+  --surface: #ffffff;
+  --surface-raised: #e8f1f2;
+  --line: #c8d8db;
+  --text: #12252c;
+  --muted: #526a72;
+  --dim: #6c8288;
+  --teal: #087f8f;
+  --lime: #4f7e14;
+  --amber: #8b6500;
+  --red: #bd3049;
+  color-scheme: light;
+  background-color: var(--bg);
+  background-image: linear-gradient(rgba(82, 106, 114, .1) 1px, transparent 1px), linear-gradient(90deg, rgba(82, 106, 114, .1) 1px, transparent 1px);
+}
+
+body[data-theme="light"]::after {
+  background: linear-gradient(180deg, rgba(243, 247, 247, .18) 0%, var(--bg) 84%);
+}
+
+body[data-theme="light"] .workflow-card,
+body[data-theme="light"] .info-panel,
+body[data-theme="light"] .futures-strip {
+  background: rgba(255, 255, 255, .94);
+}
+
+body[data-theme="light"] .button-secondary,
+body[data-theme="light"] .theme-toggle {
+  background: rgba(232, 241, 242, .8);
+}
+
+body[data-theme="light"] .status-dot {
+  box-shadow: 0 0 0 3px rgba(8, 127, 143, .12);
+}
+
+body[data-theme="light"] .status-dot-amber {
+  box-shadow: 0 0 0 3px rgba(139, 101, 0, .12);
+}
+
+body[data-theme="light"] .status-dot-red {
+  box-shadow: 0 0 0 3px rgba(189, 48, 73, .12);
 }
 
 .system-chip-muted, .state-pill-muted { color: var(--dim); }
