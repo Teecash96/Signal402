@@ -23,6 +23,22 @@ export function advanceFuturesTradeState(current: FuturesTradeState, next: Futur
   return next;
 }
 
+export function isFuturesTradeInFlight(status: FuturesTradeState): boolean {
+  return ['pending', 'approved', 'submitted', 'partially_filled'].includes(status);
+}
+
+export function isFuturesEventTimestampValid(
+  observedAt: string,
+  now = Date.now(),
+  maxAgeMs = 5 * 60 * 1000,
+  maxFutureSkewMs = 5_000,
+): boolean {
+  const timestamp = Date.parse(observedAt);
+  return Number.isFinite(timestamp)
+    && timestamp <= now + maxFutureSkewMs
+    && timestamp >= now - maxAgeMs;
+}
+
 export interface FuturesFillChangeCheck {
   reduceOnly: boolean;
   beforeQuantity: number;

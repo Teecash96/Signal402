@@ -16,8 +16,8 @@ Signal402 is a Binance CEX service for agents that need explainable market intel
 5. Run the Spot or Futures risk gate. Stop on `WAIT`, a refusal, a stale plan, or a blocked risk state.
 6. Create the exact proposal. Keep the returned execution plan and plan hash.
 7. Wait for the dashboard `APPROVE` action. Approval is not an order.
-8. For directional USDⓈ M Futures, require the literal `CONFIRM` step after a fresh revalidation. Neutral and COIN M are report only.
-9. Submit one live Binance MCP order with the exact plan fields. Do not change leverage or margin mode.
+8. For directional USDⓈ M Futures, re-read the account and context, revalidate, and wait for the second dashboard `APPROVE` on the fresh plan. Neutral and COIN M are report only.
+9. Require the literal `CONFIRM` step, then submit one live Binance MCP order with the exact fresh plan fields. Do not change leverage or margin mode.
 10. Read the authenticated order and balances or positions again. Record only the real order ID and real account change.
 11. Verify the returned execution receipt hash and preserve the ordered audit trail.
 

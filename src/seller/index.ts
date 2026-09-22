@@ -23,9 +23,11 @@ import {
   createExecutionPlan,
   expireExecutionPlan,
   isExecutionPlanCurrent,
+  isExecutionPlanIntegrityValid,
   transitionExecutionPlan,
   type ExecutionPlan,
 } from '../lib/executionPlan.js';
+import { ExecutionStateStore } from '../lib/executionState.js';
 import { RiskStateStore, type RiskState } from '../lib/riskState.js';
 import {
   emptyBodySchema,
@@ -55,7 +57,13 @@ import {
   type FuturesRiskEnvelope,
   type FuturesRiskPolicy,
 } from '../lib/futuresRisk.js';
-import { advanceFuturesTradeState, validateFuturesFillChange, type FuturesTradeState } from '../lib/futuresMonitor.js';
+import {
+  advanceFuturesTradeState,
+  isFuturesEventTimestampValid,
+  isFuturesTradeInFlight,
+  validateFuturesFillChange,
+  type FuturesTradeState,
+} from '../lib/futuresMonitor.js';
 import {
   b402IsConfigured,
   buildPaymentRequired,
@@ -105,8 +113,10 @@ const FUTURES_POLICY: FuturesRiskPolicy = {
   maxMarginUtilizationPct: boundedPolicyEnv('FUTURES_MAX_MARGIN_UTILIZATION_PCT', 25, 0, 25),
   feeReserveRate: boundedPolicyEnv('FUTURES_FEE_RESERVE_RATE', 0.001, 0, 0.1),
 };
+const FUTURES_EVENT_MAX_AGE_MS = boundedPolicyEnv('FUTURES_EVENT_MAX_AGE_MS', 5 * 60 * 1000, 1_000, 60 * 60 * 1000);
 const DASHBOARD_AUTH = new DashboardAuth();
 const RISK_STATE = new RiskStateStore();
+const EXECUTION_STATE = new ExecutionStateStore();
 
 type MarketSource = 'MCP' | 'FALLBACK' | 'UNAVAILABLE';
 type ProposalStatus = 'idle' | 'pending' | 'approved' | 'refused' | 'filled' | 'cancelled';
@@ -158,6 +168,7 @@ type FuturesProposal = {
   plan?: ExecutionPlan;
   receipt?: ExecutionReceipt;
   approvalAt?: string;
+  revalidatedAt?: string;
   paymentReceiptId?: string;
   riskEnvelope: FuturesRiskEnvelope;
   orderId?: string;
@@ -217,19 +228,43 @@ type SellerState = {
   updatedAt: string;
 };
 
+type PersistedExecutionState = Pick<SellerState,
+  | 'mcpTools'
+  | 'marketSource'
+  | 'ticker'
+  | 'marketSignal'
+  | 'lastError'
+  | 'reportsSold'
+  | 'paymentReceiptId'
+  | 'paymentStatus'
+  | 'proposal'
+  | 'futuresContext'
+  | 'futuresIntent'
+  | 'futuresRisk'
+  | 'futuresProposal'
+  | 'futuresEvents'
+  | 'carryReport'
+  | 'activity'
+  | 'updatedAt'>;
+
+const recoveredState = EXECUTION_STATE.load<PersistedExecutionState>();
+
 const state: SellerState = {
   service: 'Signal402 Seller Agent',
   symbol: SYMBOL,
   binanceMode: BINANCE_MODE === 'direct' ? 'direct' : 'host',
-  mcpStatus: 'connecting',
   mcpTools: [],
   marketSource: 'UNAVAILABLE',
   reportsSold: 0,
   paymentStatus: 'waiting',
   futuresEvents: [],
+  ...recoveredState,
+  // A restart requires the host to reconnect even though execution evidence is
+  // recovered for reconciliation.
+  mcpStatus: 'connecting',
   riskState: RISK_STATE.load(),
-  activity: [],
-  updatedAt: new Date().toISOString(),
+  activity: recoveredState?.activity ?? [],
+  updatedAt: recoveredState?.updatedAt ?? new Date().toISOString(),
 };
 
 const mcp = new BinanceMcpClient();
@@ -297,6 +332,29 @@ function snapshotQuantity(snapshot: unknown, symbol: string, positionSide: strin
 function touch(message: string): void {
   state.updatedAt = new Date().toISOString();
   state.activity = [`${new Date().toLocaleTimeString()} ${message}`.slice(0, 320), ...state.activity].slice(0, 30);
+  persistExecutionState();
+}
+
+function persistExecutionState(): void {
+  EXECUTION_STATE.persist<PersistedExecutionState>({
+    mcpTools: state.mcpTools,
+    marketSource: state.marketSource,
+    ticker: state.ticker,
+    marketSignal: state.marketSignal,
+    lastError: state.lastError,
+    reportsSold: state.reportsSold,
+    paymentReceiptId: state.paymentReceiptId,
+    paymentStatus: state.paymentStatus,
+    proposal: state.proposal,
+    futuresContext: state.futuresContext,
+    futuresIntent: state.futuresIntent,
+    futuresRisk: state.futuresRisk,
+    futuresProposal: state.futuresProposal,
+    futuresEvents: state.futuresEvents,
+    carryReport: state.carryReport,
+    activity: state.activity,
+    updatedAt: state.updatedAt,
+  });
 }
 
 function currentRiskState(): RiskState {
@@ -488,6 +546,7 @@ function publicState(): Record<string, unknown> {
         plan: futuresProposal.plan,
         receipt: futuresProposal.receipt,
         approvalAt: futuresProposal.approvalAt,
+        revalidatedAt: futuresProposal.revalidatedAt,
         paymentReceiptId: futuresProposal.paymentReceiptId,
         orderId: futuresProposal.orderId,
         filledPrice: futuresProposal.filledPrice,
@@ -882,6 +941,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.post('/api/auth/logout', (req, res) => {
+  DASHBOARD_AUTH.revoke(req);
   DASHBOARD_AUTH.clearCookie(res);
   res.setHeader('Cache-Control', 'no-store');
   res.json({ success: true });
@@ -1064,6 +1124,10 @@ app.post('/api/host/market', async (req, res) => {
     res.status(400).json({ success: false, error: 'Host market symbol does not match the configured trade symbol' });
     return;
   }
+  if (state.futuresProposal && isFuturesTradeInFlight(state.futuresProposal.status)) {
+    res.status(409).json({ success: false, error: 'An active Futures proposal cannot be replaced by Spot context. Finish or cancel it first.' });
+    return;
+  }
   state.futuresContext = undefined;
   state.futuresIntent = undefined;
   state.futuresRisk = undefined;
@@ -1111,6 +1175,10 @@ app.post('/api/host/futures/context', async (req, res) => {
   }
   if (!context.sourceToolNames.every(futuresToolNameAllowed)) {
     res.status(400).json({ success: false, error: 'Every Futures source tool must be clearly identified as a Futures or derivatives tool' });
+    return;
+  }
+  if (state.futuresProposal && isFuturesTradeInFlight(state.futuresProposal.status)) {
+    res.status(409).json({ success: false, error: 'An active Futures proposal cannot be replaced. Use /api/futures/revalidate for its fresh context.' });
     return;
   }
   const risk = evaluateFuturesRisk(context as FuturesContextInput, intent, FUTURES_POLICY);
@@ -1320,6 +1388,7 @@ app.post('/api/futures/revalidate', async (req, res) => {
   proposal.riskStatus = 'approved';
   proposal.approvalAt = undefined;
   proposal.executionConfirmedAt = undefined;
+  proposal.revalidatedAt = new Date().toISOString();
   proposal.updatedAt = new Date().toISOString();
   touch(`Futures proposal ${proposal.proposalId} passed fresh account and market revalidation. Dashboard approval is required again.`);
   await audit('seller.futures.context.revalidated', {
@@ -1611,58 +1680,65 @@ app.post('/api/trade/status', async (req, res) => {
       return;
     }
   }
-  if (proposal.plan) {
+  let nextPlan = proposal.plan;
+  if (nextPlan) {
     const planStatus = nextStatus === 'filled' ? 'filled' : nextStatus === 'refused' ? 'refused' : 'cancelled';
     try {
-      proposal.plan = nextStatus === 'filled'
-        ? transitionExecutionPlan(transitionExecutionPlan(proposal.plan, 'submitted'), 'filled')
-        : isExecutionPlanCurrent(proposal.plan) ? transitionExecutionPlan(proposal.plan, planStatus) : expireExecutionPlan(proposal.plan);
+      nextPlan = nextStatus === 'filled'
+        ? transitionExecutionPlan(transitionExecutionPlan(nextPlan, 'submitted'), 'filled')
+        : isExecutionPlanCurrent(nextPlan) ? transitionExecutionPlan(nextPlan, planStatus) : expireExecutionPlan(nextPlan);
     } catch (error: unknown) {
       res.status(409).json({ success: false, error: error instanceof Error ? error.message : 'Execution plan transition failed' });
       return;
     }
   }
-  proposal.status = nextStatus as ProposalStatus;
-  proposal.riskStatus = nextStatus === 'refused' ? 'refused' : 'approved';
-  proposal.reason = `${body.reason ?? proposal.reason}`.slice(0, 500);
-  proposal.orderId = body.orderId ?? proposal.orderId;
-  proposal.filledPrice = body.filledPrice ?? proposal.filledPrice;
-  proposal.executedQty = body.executedQty ?? proposal.executedQty;
-  proposal.source = body.source ?? proposal.source;
-  proposal.mcpToolName = body.mcpToolName ?? proposal.mcpToolName;
-  proposal.beforeBalances = body.beforeBalances ?? proposal.beforeBalances;
-  proposal.afterBalances = body.afterBalances ?? proposal.afterBalances;
-  if (nextStatus === 'filled' && proposal.plan && proposal.orderId && proposal.mcpToolName) {
-    proposal.receipt = buildExecutionReceipt({
+  const nextProposal: TradeProposal = {
+    ...proposal,
+    status: nextStatus as ProposalStatus,
+    riskStatus: nextStatus === 'refused' ? 'refused' : 'approved',
+    reason: `${body.reason ?? proposal.reason}`.slice(0, 500),
+    plan: nextPlan,
+    orderId: body.orderId ?? proposal.orderId,
+    filledPrice: body.filledPrice ?? proposal.filledPrice,
+    executedQty: body.executedQty ?? proposal.executedQty,
+    source: body.source ?? proposal.source,
+    mcpToolName: body.mcpToolName ?? proposal.mcpToolName,
+    beforeBalances: body.beforeBalances ?? proposal.beforeBalances,
+    afterBalances: body.afterBalances ?? proposal.afterBalances,
+    updatedAt: new Date().toISOString(),
+  };
+  if (nextStatus === 'filled' && nextProposal.plan && nextProposal.orderId && nextProposal.mcpToolName) {
+    const receipt = buildExecutionReceipt({
       kind: 'spot',
-      proposalId: proposal.proposalId,
-      planId: proposal.plan.planId,
-      paymentReceiptId: proposal.paymentReceiptId,
-      riskHash: proposal.plan.riskHash,
-      approvalAt: proposal.approvalAt,
+      proposalId: nextProposal.proposalId,
+      planId: nextProposal.plan.planId,
+      paymentReceiptId: nextProposal.paymentReceiptId,
+      riskHash: nextProposal.plan.riskHash,
+      approvalAt: nextProposal.approvalAt,
       submittedAt: proposal.updatedAt,
       settledAt: new Date().toISOString(),
-      mcpToolName: proposal.mcpToolName,
-      orderId: proposal.orderId,
-      filledPrice: proposal.filledPrice,
-      executedQty: proposal.executedQty,
+      mcpToolName: nextProposal.mcpToolName,
+      orderId: nextProposal.orderId,
+      filledPrice: nextProposal.filledPrice,
+      executedQty: nextProposal.executedQty,
       quoteAmount: body.amountUSDT,
-      beforeBalances: proposal.beforeBalances,
-      afterBalances: proposal.afterBalances,
+      beforeBalances: nextProposal.beforeBalances,
+      afterBalances: nextProposal.afterBalances,
       events: [
-        { sequence: 1, type: 'ORDER_SUBMITTED', observedAt: proposal.updatedAt, detail: { source: proposal.source } },
-        { sequence: 2, type: 'FILL_RECONCILED', observedAt: new Date().toISOString(), detail: { orderId: proposal.orderId } },
+        { sequence: 1, type: 'ORDER_SUBMITTED', observedAt: proposal.updatedAt, detail: { source: nextProposal.source } },
+        { sequence: 2, type: 'FILL_RECONCILED', observedAt: new Date().toISOString(), detail: { orderId: nextProposal.orderId } },
       ],
     });
-    if (!executionReceiptSchema.safeParse(proposal.receipt).success) {
+    if (!executionReceiptSchema.safeParse(receipt).success) {
       res.status(500).json({ success: false, error: 'Execution receipt failed schema validation' });
       return;
     }
+    nextProposal.receipt = receipt;
   }
-  proposal.updatedAt = new Date().toISOString();
-  touch(nextStatus === 'filled' ? `REAL TRADE FILLED. Order ${proposal.orderId}` : `Trade ${nextStatus}: ${proposal.reason}`);
-  await audit(`seller.trade.${nextStatus}`, { proposalId: proposal.proposalId, planId: proposal.plan?.planId, planHash: proposal.plan?.planHash, receiptId: proposal.receipt?.receiptId, orderId: proposal.orderId, filledPrice: proposal.filledPrice, beforeBalances: proposal.beforeBalances, afterBalances: proposal.afterBalances });
-  res.json({ success: true, status: proposal.status, orderId: proposal.orderId, receipt: proposal.receipt, plan: proposal.plan });
+  state.proposal = nextProposal;
+  touch(nextStatus === 'filled' ? `REAL TRADE FILLED. Order ${nextProposal.orderId}` : `Trade ${nextStatus}: ${nextProposal.reason}`);
+  await audit(`seller.trade.${nextStatus}`, { proposalId: nextProposal.proposalId, planId: nextProposal.plan?.planId, planHash: nextProposal.plan?.planHash, receiptId: nextProposal.receipt?.receiptId, orderId: nextProposal.orderId, filledPrice: nextProposal.filledPrice, beforeBalances: nextProposal.beforeBalances, afterBalances: nextProposal.afterBalances });
+  res.json({ success: true, status: nextProposal.status, orderId: nextProposal.orderId, receipt: nextProposal.receipt, plan: nextProposal.plan });
 });
 
 app.post('/api/futures/proposal', async (req, res) => {
@@ -1852,6 +1928,10 @@ app.post('/api/futures/confirm', async (req, res) => {
     res.status(409).json({ success: false, error: 'Dashboard APPROVE is required before CONFIRM' });
     return;
   }
+  if (!proposal.revalidatedAt || !proposal.approvalAt || Date.parse(proposal.approvalAt) < Date.parse(proposal.revalidatedAt)) {
+    res.status(409).json({ success: false, error: 'Fresh Futures revalidation and a new dashboard APPROVE are required before CONFIRM' });
+    return;
+  }
   if (!proposal.plan || !isExecutionPlanCurrent(proposal.plan) || proposal.plan.status !== 'approved') {
     res.status(409).json({ success: false, error: 'The approved Futures execution plan is stale or already consumed' });
     return;
@@ -1922,8 +2002,13 @@ app.post('/api/futures/status', async (req, res) => {
     res.status(403).json({ success: false, error: 'Direct Futures receipts require an explicitly Binance approved direct client' });
     return;
   }
-  if (!Number.isFinite(Date.parse(body.observedAt)) || Date.parse(body.observedAt) - Date.now() > 5_000) {
-    res.status(400).json({ success: false, error: 'Futures event timestamp is invalid' });
+  if (!isFuturesEventTimestampValid(body.observedAt, Date.now(), FUTURES_EVENT_MAX_AGE_MS)) {
+    res.status(400).json({ success: false, error: 'Futures event timestamp is invalid, stale, or too far in the future' });
+    return;
+  }
+  const latestObservedAt = state.futuresEvents[0]?.observedAt;
+  if (latestObservedAt && Date.parse(body.observedAt) < Date.parse(latestObservedAt)) {
+    res.status(409).json({ success: false, error: 'Out-of-order Futures events cannot replace newer execution state' });
     return;
   }
   if (body.eventType === 'MARGIN_CALL' && body.status !== 'liquidated') {
@@ -1939,8 +2024,8 @@ app.post('/api/futures/status', async (req, res) => {
     res.status(409).json({ success: false, error: 'The exact CONFIRM step is required before a live Futures order event' });
     return;
   }
-  if (body.status !== 'rejected' && body.status !== 'cancelled' && (!proposal.plan || !isExecutionPlanCurrent(proposal.plan) || proposal.plan.status === 'expired')) {
-    res.status(409).json({ success: false, error: 'The Futures execution plan is stale or already consumed' });
+  if (body.status !== 'rejected' && body.status !== 'cancelled' && (!proposal.plan || !isExecutionPlanIntegrityValid(proposal.plan))) {
+    res.status(409).json({ success: false, error: 'The Futures execution plan is missing or failed integrity validation' });
     return;
   }
   if (body.orderId && proposal.orderId && body.orderId !== proposal.orderId) {
@@ -2000,86 +2085,94 @@ app.post('/api/futures/status', async (req, res) => {
     observedAt: body.observedAt,
     reason: body.reason,
   };
-  state.futuresEvents = [event, ...state.futuresEvents].slice(0, 50);
-  if (proposal.plan) {
+  const nextEvents = [event, ...state.futuresEvents].slice(0, 50);
+  let nextPlan = proposal.plan;
+  if (nextPlan) {
     let planStatus: 'submitted' | 'partially_filled' | 'filled' | 'refused' | 'cancelled' | 'expired' = 'cancelled';
     if (body.status === 'submitted') planStatus = 'submitted';
     else if (body.status === 'partially_filled') planStatus = 'partially_filled';
-    else if (body.status === 'filled') planStatus = 'filled';
+    else if (body.status === 'filled' || body.status === 'liquidated') planStatus = 'filled';
     else if (body.status === 'rejected') planStatus = 'refused';
     try {
-      proposal.plan = body.status === 'filled'
-        ? transitionExecutionPlan(proposal.plan, 'filled')
-        : transitionExecutionPlan(proposal.plan, planStatus);
+      if (!(body.status === 'liquidated' && nextPlan.status === 'filled')) {
+        nextPlan = transitionExecutionPlan(nextPlan, planStatus);
+      }
     } catch (error: unknown) {
       res.status(409).json({ success: false, error: error instanceof Error ? error.message : 'Futures execution plan transition failed' });
       return;
     }
   }
-  proposal.status = nextStatus;
-  proposal.riskStatus = body.status === 'rejected' ? 'refused' : 'approved';
-  proposal.orderId = body.orderId ?? proposal.orderId;
-  proposal.filledPrice = body.filledPrice ?? proposal.filledPrice;
-  proposal.executedQty = body.executedQty ?? proposal.executedQty;
-  proposal.realizedPnlUSDT = body.realizedPnlUSDT ?? proposal.realizedPnlUSDT;
-  proposal.source = body.source;
-  proposal.mcpToolName = body.mcpToolName;
-  proposal.beforeAccountSnapshot = body.beforeAccountSnapshot ?? proposal.beforeAccountSnapshot;
-  proposal.afterAccountSnapshot = body.afterAccountSnapshot ?? proposal.afterAccountSnapshot;
-  proposal.beforePositionSnapshot = body.beforePositionSnapshot ?? proposal.beforePositionSnapshot;
-  proposal.afterPositionSnapshot = body.afterPositionSnapshot ?? proposal.afterPositionSnapshot;
-  if (body.afterAccountSnapshot) {
-    const riskSnapshot = RISK_STATE.updateEquity(body.afterAccountSnapshot.walletBalanceUSDT);
-    state.riskState = riskSnapshot;
-    if (riskSnapshot.drawdownState === 'HALTED') await audit('risk.drawdown.halted', { proposalId: proposal.proposalId, equityUSDT: body.afterAccountSnapshot.walletBalanceUSDT });
-  }
-  if (body.status === 'filled' && proposal.plan && proposal.orderId && proposal.mcpToolName) {
-    const orderedEvents = [...state.futuresEvents].reverse().map((item, index) => ({
+  const nextProposal: FuturesProposal = {
+    ...proposal,
+    status: nextStatus,
+    riskStatus: body.status === 'rejected' ? 'refused' : 'approved',
+    plan: nextPlan,
+    orderId: body.orderId ?? proposal.orderId,
+    filledPrice: body.filledPrice ?? proposal.filledPrice,
+    executedQty: body.executedQty ?? proposal.executedQty,
+    realizedPnlUSDT: body.realizedPnlUSDT ?? proposal.realizedPnlUSDT,
+    source: body.source,
+    mcpToolName: body.mcpToolName,
+    beforeAccountSnapshot: body.beforeAccountSnapshot ?? proposal.beforeAccountSnapshot,
+    afterAccountSnapshot: body.afterAccountSnapshot ?? proposal.afterAccountSnapshot,
+    beforePositionSnapshot: body.beforePositionSnapshot ?? proposal.beforePositionSnapshot,
+    afterPositionSnapshot: body.afterPositionSnapshot ?? proposal.afterPositionSnapshot,
+    updatedAt: new Date().toISOString(),
+  };
+  if (body.status === 'filled' && nextProposal.plan && nextProposal.orderId && nextProposal.mcpToolName) {
+    const orderedEvents = [...nextEvents].reverse().map((item, index) => ({
       sequence: index + 1,
       type: `${item.eventType}:${item.status}`,
       observedAt: item.observedAt,
       detail: { orderId: item.orderId, source: item.source, mcpToolName: item.mcpToolName },
     }));
-    proposal.receipt = buildExecutionReceipt({
+    const receipt = buildExecutionReceipt({
       kind: 'futures',
-      proposalId: proposal.proposalId,
-      planId: proposal.plan.planId,
-      paymentReceiptId: proposal.paymentReceiptId,
-      contextHash: proposal.plan.contextHash,
-      riskHash: proposal.plan.riskHash,
-      approvalAt: proposal.approvalAt,
-      confirmationAt: proposal.executionConfirmedAt,
+      proposalId: nextProposal.proposalId,
+      planId: nextProposal.plan.planId,
+      paymentReceiptId: nextProposal.paymentReceiptId,
+      contextHash: nextProposal.plan.contextHash,
+      riskHash: nextProposal.plan.riskHash,
+      approvalAt: nextProposal.approvalAt,
+      confirmationAt: nextProposal.executionConfirmedAt,
       submittedAt: orderedEvents.find((item) => item.type.endsWith(':submitted'))?.observedAt ?? body.observedAt,
       settledAt: body.observedAt,
-      mcpToolName: proposal.mcpToolName,
-      orderId: proposal.orderId,
-      filledPrice: proposal.filledPrice,
-      executedQty: proposal.executedQty,
-      quoteAmount: proposal.notionalUSDT,
-      beforePositions: proposal.beforePositionSnapshot,
-      afterPositions: proposal.afterPositionSnapshot,
+      mcpToolName: nextProposal.mcpToolName,
+      orderId: nextProposal.orderId,
+      filledPrice: nextProposal.filledPrice,
+      executedQty: nextProposal.executedQty,
+      quoteAmount: nextProposal.notionalUSDT,
+      beforePositions: nextProposal.beforePositionSnapshot,
+      afterPositions: nextProposal.afterPositionSnapshot,
       events: orderedEvents,
     });
-    if (!executionReceiptSchema.safeParse(proposal.receipt).success) {
+    if (!executionReceiptSchema.safeParse(receipt).success) {
       res.status(500).json({ success: false, error: 'Futures execution receipt failed schema validation' });
       return;
     }
+    nextProposal.receipt = receipt;
   }
-  proposal.updatedAt = new Date().toISOString();
-  touch(`Futures ${body.status.replace('_', ' ')} event received${proposal.orderId ? ` for ${proposal.orderId}` : ''}.`);
+  if (body.afterAccountSnapshot) {
+    const riskSnapshot = RISK_STATE.updateEquity(body.afterAccountSnapshot.walletBalanceUSDT);
+    state.riskState = riskSnapshot;
+    if (riskSnapshot.drawdownState === 'HALTED') await audit('risk.drawdown.halted', { proposalId: nextProposal.proposalId, equityUSDT: body.afterAccountSnapshot.walletBalanceUSDT });
+  }
+  state.futuresEvents = nextEvents;
+  state.futuresProposal = nextProposal;
+  touch(`Futures ${body.status.replace('_', ' ')} event received${nextProposal.orderId ? ` for ${nextProposal.orderId}` : ''}.`);
   await audit(`seller.futures.${body.status}`, {
-    proposalId: proposal.proposalId,
-    planId: proposal.plan?.planId,
-    planHash: proposal.plan?.planHash,
-    receiptId: proposal.receipt?.receiptId,
+    proposalId: nextProposal.proposalId,
+    planId: nextProposal.plan?.planId,
+    planHash: nextProposal.plan?.planHash,
+    receiptId: nextProposal.receipt?.receiptId,
     eventType: body.eventType,
-    orderId: proposal.orderId,
-    filledPrice: proposal.filledPrice,
-    executedQty: proposal.executedQty,
+    orderId: nextProposal.orderId,
+    filledPrice: nextProposal.filledPrice,
+    executedQty: nextProposal.executedQty,
     mcpToolName: body.mcpToolName,
     observedAt: body.observedAt,
   });
-  res.json({ success: true, status: proposal.status, orderId: proposal.orderId, filledPrice: proposal.filledPrice, executedQty: proposal.executedQty, plan: proposal.plan, receipt: proposal.receipt, riskState: currentRiskState() });
+  res.json({ success: true, status: nextProposal.status, orderId: nextProposal.orderId, filledPrice: nextProposal.filledPrice, executedQty: nextProposal.executedQty, plan: nextProposal.plan, receipt: nextProposal.receipt, riskState: currentRiskState() });
 });
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {

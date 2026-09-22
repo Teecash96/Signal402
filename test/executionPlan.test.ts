@@ -39,6 +39,22 @@ test('execution plans allow only ordered single use transitions', () => {
   assert.equal(planOrderMatches(filled, { ...input, symbol: 'BNBUSDT', positionSide: undefined, leverage: undefined, marginMode: undefined }), true);
 });
 
+test('confirmed Futures plans accept immediate and partial fills', () => {
+  const futuresInput = { ...input, kind: 'futures' as const, positionSide: 'LONG' as const, leverage: 2, marginMode: 'ISOLATED' as const };
+  const created = createExecutionPlan({ ...futuresInput, now: '2026-01-01T00:00:00.000Z' });
+  const approved = transitionExecutionPlan(created, 'approved', '2026-01-01T00:00:01.000Z');
+  const confirmed = transitionExecutionPlan(approved, 'confirmed', '2026-01-01T00:00:02.000Z');
+  assert.equal(transitionExecutionPlan(confirmed, 'filled', '2026-01-01T00:00:03.000Z').status, 'filled');
+  assert.equal(transitionExecutionPlan(confirmed, 'partially_filled', '2026-01-01T00:00:03.000Z').status, 'partially_filled');
+});
+
+test('submitted plans accept authenticated fills after the authorization TTL', () => {
+  const created = createExecutionPlan({ ...input, now: '2026-01-01T00:00:00.000Z' });
+  const approved = transitionExecutionPlan(created, 'approved', '2026-01-01T00:00:01.000Z');
+  const submitted = transitionExecutionPlan(approved, 'submitted', '2026-01-01T00:00:02.000Z');
+  assert.equal(transitionExecutionPlan(submitted, 'filled', '2026-01-01T00:02:00.000Z').status, 'filled');
+});
+
 test('tampering with the order fields invalidates a plan', () => {
   const created = createExecutionPlan({ ...input, now: '2026-01-01T00:00:00.000Z' });
   const tampered = { ...created, notionalUSDT: 9 };
