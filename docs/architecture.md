@@ -113,7 +113,9 @@ sequenceDiagram
     Trader->>Dashboard: APPROVE
     Dashboard-->>Agent: Approval recorded
     Agent->>Host: Fresh account read and revalidation
-    Trader->>Dashboard: CONFIRM when Futures requires it
+    Signal-->>Dashboard: Fresh plan requires APPROVE again for Futures
+    Trader->>Dashboard: APPROVE fresh Futures plan
+    Trader->>Dashboard: CONFIRM exact Futures order
     Agent->>Binance: One capped order
     Binance-->>Agent: Real order and account events
     Agent->>Signal: Reconcile order, fill, and balances

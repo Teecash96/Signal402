@@ -43,9 +43,10 @@ Spot remains the default. Use this branch only when the human has selected an ex
 4. Request the Seller access response. Free mode is the default and returns the live report with no payment or receipt. If `SIGNAL402_ACCESS_MODE=b402`, show the human the exact 0.01 USDC terms and pay only after explicit approval. The Futures risk and execution gates remain unchanged.
 5. Neutral mode returns a hedge ratio and evidence but is `REPORT ONLY`. It never submits two hedge legs. COIN M is also `REPORT ONLY` and never accepts an order write.
 6. Directional USD M can create a proposal only when `executionEligible=true` and the order includes a declared protective stop plan supported by the live host. The Seller checks the proof hashes against its current context.
-7. Wait for the dashboard `APPROVE`. Then require the human to type `CONFIRM` for the exact symbol, side, position side, quantity, notional, and `reduceOnly` value.
-8. Re-read the account and context and call `signal402_revalidate_futures_context`. If revalidation fails, stop. Submit exactly one real USD M MARKET order through the runtime discovered Binance MCP tool. Use existing leverage at or below 3x and isolated margin. Never use `quoteOrderQty`. Never change leverage, margin mode, or position mode automatically.
-9. Monitor the authenticated Futures user stream or order status. Record the real submitted, order update, account update, fill, margin call, and liquidation events with `signal402_record_futures_event`. A filled event must include before and after account and position snapshots that prove the real state changed.
+7. Wait for the first dashboard `APPROVE`, then re-read the account and context and call `signal402_revalidate_futures_context`. If revalidation fails, stop.
+8. Successful revalidation creates a fresh plan. Wait for the second dashboard `APPROVE`, then require the human to type `CONFIRM` for the exact symbol, side, position side, quantity, notional, and `reduceOnly` value.
+9. Submit exactly one real USD M MARKET order through the runtime discovered Binance MCP tool. Use existing leverage at or below 3x and isolated margin. Never use `quoteOrderQty`. Never change leverage, margin mode, or position mode automatically.
+10. Monitor the authenticated Futures user stream or order status. Record the real submitted, order update, account update, fill, margin call, and liquidation events with `signal402_record_futures_event`. A filled event must include before and after account and position snapshots that prove the real state changed.
 
 ## Hard prohibitions
 

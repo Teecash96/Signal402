@@ -78,6 +78,10 @@ export function executionPlanHash(plan: ExecutionPlan): string {
   return sha256(immutable);
 }
 
+export function isExecutionPlanIntegrityValid(plan: ExecutionPlan): boolean {
+  return executionPlanHash(plan) === plan.planHash;
+}
+
 export function createExecutionPlan(input: ExecutionPlanInput): ExecutionPlan {
   const start = new Date(input.now === undefined ? Date.now() : input.now);
   if (!Number.isFinite(start.getTime())) throw new Error('Execution plan timestamp is invalid');
@@ -118,7 +122,7 @@ export function isExecutionPlanCurrent(plan: ExecutionPlan, now: Date | string |
   return plan.status !== 'expired'
     && !['filled', 'refused', 'cancelled'].includes(plan.status)
     && Date.parse(plan.expiresAt) > timestamp
-    && executionPlanHash(plan) === plan.planHash;
+    && isExecutionPlanIntegrityValid(plan);
 }
 
 export function expireExecutionPlan(plan: ExecutionPlan, now: Date | string | number = Date.now()): ExecutionPlan {
@@ -130,7 +134,7 @@ export function expireExecutionPlan(plan: ExecutionPlan, now: Date | string | nu
 const transitions: Record<ExecutionPlanStatus, readonly ExecutionPlanStatus[]> = {
   proposed: ['approved', 'refused', 'cancelled', 'expired'],
   approved: ['confirmed', 'submitted', 'refused', 'cancelled', 'expired'],
-  confirmed: ['submitted', 'refused', 'cancelled', 'expired'],
+  confirmed: ['submitted', 'partially_filled', 'filled', 'refused', 'cancelled', 'expired'],
   submitted: ['partially_filled', 'filled', 'refused', 'cancelled'],
   partially_filled: ['filled', 'refused', 'cancelled'],
   filled: [],
@@ -144,8 +148,13 @@ export function transitionExecutionPlan(plan: ExecutionPlan, nextStatus: Executi
   if (!transitions[plan.status].includes(nextStatus)) {
     throw new Error(`Invalid execution plan transition: ${plan.status} -> ${nextStatus}`);
   }
-  if (nextStatus !== 'expired' && !isExecutionPlanCurrent(plan, now)) {
-    throw new Error('Execution plan is expired, tampered, or already consumed');
+  if (nextStatus !== 'expired' && !isExecutionPlanIntegrityValid(plan)) {
+    throw new Error('Execution plan is tampered');
+  }
+  // The TTL controls authorization through order submission. Once Binance has
+  // accepted the order, authenticated fill events may arrive after the TTL.
+  if (nextStatus !== 'expired' && ['proposed', 'approved', 'confirmed'].includes(plan.status) && !isExecutionPlanCurrent(plan, now)) {
+    throw new Error('Execution plan is expired or already consumed');
   }
   return { ...plan, status: nextStatus, updatedAt: iso(now) };
 }

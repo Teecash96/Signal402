@@ -175,6 +175,13 @@ export class DashboardAuth {
     return this.sessions.has(key);
   }
 
+  public revoke(req: Request): boolean {
+    if (!isUsableSecret(this.sessionSecret)) return false;
+    const token = parseCookieHeader(req.headers.cookie)[SESSION_COOKIE];
+    if (!token) return false;
+    return this.sessions.delete(hashSession(`${this.sessionSecret}:${token}`));
+  }
+
   public require(req: Request, res: Response): boolean {
     if (this.isAuthenticated(req)) return true;
     res.status(401).json({ success: false, error: 'Dashboard login required' });

@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { advanceFuturesTradeState, validateFuturesFillChange } from '../src/lib/futuresMonitor.js';
+import {
+  advanceFuturesTradeState,
+  isFuturesEventTimestampValid,
+  isFuturesTradeInFlight,
+  validateFuturesFillChange,
+} from '../src/lib/futuresMonitor.js';
 import { evaluateFuturesRisk, type FuturesContextInput, type FuturesOrderIntentInput } from '../src/lib/futuresRisk.js';
 import { futuresContextSchema, futuresRiskEnvelopeSchema, futuresStatusInputSchema } from '../src/lib/schemas.js';
 
@@ -166,6 +171,16 @@ test('Futures order event transitions accept valid flow and reject invalid flow'
   assert.equal(advanceFuturesTradeState('submitted', 'partially_filled'), 'partially_filled');
   assert.equal(advanceFuturesTradeState('partially_filled', 'filled'), 'filled');
   assert.throws(() => advanceFuturesTradeState('pending', 'filled'), /Invalid Futures order event transition/);
+});
+
+test('Futures activity and event freshness helpers fail closed', () => {
+  assert.equal(isFuturesTradeInFlight('pending'), true);
+  assert.equal(isFuturesTradeInFlight('partially_filled'), true);
+  assert.equal(isFuturesTradeInFlight('filled'), false);
+  const now = Date.parse('2026-01-01T00:05:00.000Z');
+  assert.equal(isFuturesEventTimestampValid('2026-01-01T00:04:59.000Z', now), true);
+  assert.equal(isFuturesEventTimestampValid('2025-12-31T23:59:59.000Z', now), false);
+  assert.equal(isFuturesEventTimestampValid('2026-01-01T00:05:06.000Z', now), false);
 });
 
 test('fill proof rejects unchanged snapshots and accepts the expected change', () => {

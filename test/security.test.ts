@@ -22,6 +22,14 @@ test('dashboard authentication hashes passwords and rate limits failures', async
     assert.equal(auth.status().configured, true);
     assert.equal((await auth.login('security-test', 'wrong password', '', undefined)).status, 401);
     assert.equal((await auth.login('security-test', 'correct horse battery staple', '', undefined)).ok, true);
+    const session = await auth.login('logout-test', 'correct horse battery staple', '', undefined);
+    assert.equal(session.ok, true);
+    if (session.ok) {
+      const request = { headers: { cookie: `signal402_session=${session.token}` } } as never;
+      assert.equal(auth.isAuthenticated(request), true);
+      assert.equal(auth.revoke(request), true);
+      assert.equal(auth.isAuthenticated(request), false);
+    }
     for (let index = 0; index < 5; index += 1) await auth.login('blocked-test', 'wrong password', '', undefined);
     assert.equal((await auth.login('blocked-test', 'correct horse battery staple', '', undefined)).status, 429);
   } finally {
